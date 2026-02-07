@@ -76,6 +76,7 @@ from tpu_inference.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
 from tpu_inference.runner.structured_decoding_manager import \
     StructuredDecodingManager
+from tpu_inference.spec_decode.jax.dflash import DFlashProposer
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 from tpu_inference.utils import (device_array, make_optimized_mesh,
                                  time_function, to_jax_dtype, to_torch_dtype)
@@ -383,6 +384,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "eagle3":
                 self.drafter = Eagle3Proposer(self.vllm_config, self)
+            elif self.speculative_config.method == "dflash":
+                self.drafter = DFlashProposer(self.vllm_config, self)
             else:
                 raise NotImplementedError(
                     "Unsupported speculative decoding method: "

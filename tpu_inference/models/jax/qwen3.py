@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from itertools import islice
 from typing import List, Optional, Tuple
 
 import jax
@@ -44,6 +45,37 @@ from tpu_inference.models.jax.utils.weight_utils import LoadableWithIterator
 logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
+
+
+def _build_target_layer_ids(num_target_layers: int,
+                            num_draft_layers: int) -> list[int]:
+    if num_draft_layers <= 1:
+        return [num_target_layers // 2]
+    start = 1
+    end = max(start, num_target_layers - 3)
+    span = end - start
+    return [
+        int(round(start + (i * span) / (num_draft_layers - 1)))
+        for i in range(num_draft_layers)
+    ]
+
+
+def _get_dflash_target_layer_ids(target_num_layers: int,
+                                 draft_hf_config: Qwen3Config) -> list[int]:
+    cfg = getattr(draft_hf_config, "dflash_config", None)
+    if isinstance(cfg, dict):
+        layer_ids = cfg.get("target_layer_ids", None)
+        if layer_ids:
+            return [int(x) for x in layer_ids]
+    elif cfg is not None and hasattr(cfg, "target_layer_ids"):
+        layer_ids = getattr(cfg, "target_layer_ids")
+        if layer_ids:
+            return [int(x) for x in layer_ids]
+
+    num_target_layers = int(
+        getattr(draft_hf_config, "num_target_layers", target_num_layers))
+    num_draft_layers = int(getattr(draft_hf_config, "num_hidden_layers", 1))
+    return _build_target_layer_ids(num_target_layers, num_draft_layers)
 
 
 class Qwen3Attention(JaxModule):
@@ -262,6 +294,41 @@ class Qwen3Model(Qwen2Model):
         else:
             self.norm = PPMissingLayer()
 
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+        if vllm_config.speculative_config and vllm_config.speculative_config.method == "dflash":
+            draft_hf_config = (
+                vllm_config.speculative_config.draft_model_config.hf_config)
+            self.aux_hidden_state_layers = tuple(
+                _get_dflash_target_layer_ids(hf_config.num_hidden_layers,
+                                             draft_hf_config))
+
+    def __call__(
+        self,
+        kv_caches: List[jax.Array],
+        input_ids: Optional[jax.Array],
+        attention_metadata: AttentionMetadata,
+        inputs_embeds: Optional[jax.Array] = None,
+    ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array]]:
+        if inputs_embeds is not None:
+            x = inputs_embeds
+        else:
+            x = self.embed_tokens(input_ids)
+        aux_hidden_states = []
+        for i, layer in enumerate(
+                islice(self.layers, self.start_layer, self.end_layer)):
+            layer_idx = self.start_layer + i
+            kv_cache = kv_caches[i]
+            kv_cache, x = layer(
+                kv_cache,
+                x,
+                attention_metadata,
+            )
+            kv_caches[i] = kv_cache
+            if layer_idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(x)
+        x = self.norm(x)
+        return kv_caches, x, aux_hidden_states
+
 
 class Qwen3ForCausalLM(JaxModule, LoadableWithIterator):
 
@@ -309,7 +376,7 @@ class Qwen3ForCausalLM(JaxModule, LoadableWithIterator):
         if not is_first_rank:
             assert intermediate_tensors is not None
             inputs_embeds = intermediate_tensors["hidden_states"]
-        kv_caches, x = self.model(
+        kv_caches, x, aux_hidden_states = self.model(
             kv_caches,
             input_ids,
             attention_metadata,
@@ -317,7 +384,7 @@ class Qwen3ForCausalLM(JaxModule, LoadableWithIterator):
         )
         if not is_last_rank:
             x = JaxIntermediateTensors(tensors={"hidden_states": x}, )
-        return kv_caches, x, []
+        return kv_caches, x, aux_hidden_states
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         if hasattr(self, 'lm_head'):

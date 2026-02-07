@@ -26,6 +26,7 @@ from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 from tpu_inference.runner.speculative_decoding_manager import \
     SpecDecodeMetadata
 from tpu_inference.runner.tpu_runner import TPUModelRunner
+from tpu_inference.spec_decode.jax.dflash import DFlashProposer
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 
 
@@ -104,6 +105,26 @@ class TestSpeculativeDecodingManager:
             mock_propose_eagle.assert_called_once()
             assert self.runner.speculative_decoding_manager._draft_token_ids == [
                 [10, 11]
+            ]
+
+    def test_propose_draft_token_ids_dispatches_to_dflash(self):
+        """Tests that propose_draft_token_ids calls the correct dflash method."""
+        self.runner.drafter = MagicMock(spec=DFlashProposer)
+        self.runner.speculative_config.method = "dflash"
+
+        with patch.object(self.runner.speculative_decoding_manager,
+                          'propose_dflash_draft_token_ids',
+                          return_value=[[12, 13]]) as mock_propose_dflash:
+            self.runner.speculative_decoding_manager.propose_draft_token_ids(
+                sampled_token_ids=[[1]],
+                aux_hidden_states=None,
+                attn_metadata=MagicMock(),
+                spec_decode_metadata=None,
+            )
+
+            mock_propose_dflash.assert_called_once()
+            assert self.runner.speculative_decoding_manager._draft_token_ids == [
+                [12, 13]
             ]
 
     def test_propose_draft_token_ids_wrong_drafter_type(self):
@@ -300,13 +321,22 @@ class TestSpeculativeDecodingManager:
         assert np.asarray(metadata.draft_lengths).tolist(
         ) == expected_padded_num_draft_tokens
 
+    @pytest.mark.parametrize(
+        "method,propose_method_name,drafter_cls",
+        [
+            ("eagle3", "propose_eagle3_draft_token_ids", Eagle3Proposer),
+            ("dflash", "propose_dflash_draft_token_ids", DFlashProposer),
+        ],
+    )
     @pytest.mark.parametrize("spec_decode_metadata_is_none", [True, False])
-    def test_propose_eagle3_draft_token_ids(self,
-                                            spec_decode_metadata_is_none):
-        """Tests the logic for proposing Eagle3 draft tokens."""
+    def test_propose_model_based_draft_token_ids(self, method,
+                                                 propose_method_name,
+                                                 drafter_cls,
+                                                 spec_decode_metadata_is_none):
+        """Tests the shared model-based draft-token proposal logic."""
         # 1. ===== Setup =====
-        self.runner.drafter = MagicMock(spec=Eagle3Proposer)
-        self.runner.speculative_config.method = "eagle3"
+        self.runner.drafter = MagicMock(spec=drafter_cls)
+        self.runner.speculative_config.method = method
 
         # Mock TPUModelRunner attributes
         self.runner.input_batch = MagicMock()
@@ -349,10 +379,12 @@ class TestSpeculativeDecodingManager:
         input_ids = MagicMock()
 
         # 2. ===== Act =====
+        propose_method = getattr(self.runner.speculative_decoding_manager,
+                                 propose_method_name)
         with patch(
                 "tpu_inference.runner.speculative_decoding_manager.device_array",
                 side_effect=lambda mesh, x: x):
-            result = self.runner.speculative_decoding_manager.propose_eagle3_draft_token_ids(
+            result = propose_method(
                 sampled_token_ids,
                 aux_hidden_states,
                 attn_metadata,

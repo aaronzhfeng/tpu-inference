@@ -132,15 +132,19 @@ class KVCacheManager:
                     kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(
                         block_size, num_kv_heads, head_size)
 
-            if self.runner.speculative_config and self.runner.speculative_config.method == "eagle3":
+            if self.runner.speculative_config and self.runner.speculative_config.method in (
+                    "eagle3", "dflash"):
                 draft_model_config = self.runner.speculative_config.draft_model_config
                 hf_config = draft_model_config.hf_config
                 num_kv_heads = common_utils.get_padded_num_heads(
                     hf_config.num_key_value_heads, model_cnt)
                 head_size = common_utils.get_padded_head_dim(
                     hf_config.hidden_size // hf_config.num_attention_heads)
-                # Eagle3 has only 1 layer
-                for i in range(1):
+                num_draft_layers = 1
+                if self.runner.speculative_config.method == "dflash":
+                    num_draft_layers = int(getattr(hf_config,
+                                                   "num_hidden_layers", 1))
+                for i in range(num_draft_layers):
                     if self.use_mla:
                         kv_cache_spec[
                             f"draft_layer.{i}"] = self._create_attention_spec(

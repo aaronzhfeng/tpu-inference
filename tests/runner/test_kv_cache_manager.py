@@ -507,3 +507,35 @@ class TestKVCacheManager:
             spec = kv_cache_spec[f"layer.{i}"]
             assert isinstance(spec, MLAAttentionSpec)
             assert spec.num_kv_heads == 1
+
+    def test_get_kv_cache_spec_with_dflash_multi_layer(self):
+        # tests we create kv cache specs for multiple dflash draft layers
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        mock_speculative_config = MagicMock()
+        mock_speculative_config.method = "dflash"
+        mock_draft_model_config = MagicMock()
+        mock_hf_config = MagicMock()
+        mock_hf_config.num_key_value_heads = 4
+        mock_hf_config.hidden_size = 1024
+        mock_hf_config.num_attention_heads = 8
+        mock_hf_config.num_hidden_layers = 3
+        mock_draft_model_config.hf_config = mock_hf_config
+        mock_speculative_config.draft_model_config = mock_draft_model_config
+        self.runner.speculative_config = mock_speculative_config
+
+        kv_cache_spec = self.runner.get_kv_cache_spec()
+
+        draft_layer_names = sorted(
+            name for name in kv_cache_spec if name.startswith("draft_layer."))
+        assert draft_layer_names == [
+            "draft_layer.0", "draft_layer.1", "draft_layer.2"
+        ]
+
+        for layer_name in draft_layer_names:
+            draft_spec = kv_cache_spec[layer_name]
+            assert isinstance(draft_spec, FullAttentionSpec)
+            assert draft_spec.block_size == self.runner.vllm_config.cache_config.block_size
+            assert draft_spec.num_kv_heads == common_utils.get_padded_num_heads(
+                4, self.runner.mesh.shape["model"])
+            assert draft_spec.head_size == common_utils.get_padded_head_dim(128)
+            assert draft_spec.dtype == torch.bfloat16

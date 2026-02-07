@@ -78,6 +78,19 @@ class TestTPUJaxRunner:
         supported_tasks = self.runner.get_supported_tasks()
         assert supported_tasks == ("generate", )
 
+    @patch('tpu_inference.runner.tpu_runner.DFlashProposer')
+    def test_init_speculative_decoding_dflash(self, mock_dflash_proposer):
+        mock_drafter = MagicMock()
+        mock_dflash_proposer.return_value = mock_drafter
+        self.runner.speculative_config.method = "dflash"
+
+        self.runner._init_speculative_decoding()
+
+        mock_dflash_proposer.assert_called_once_with(self.runner.vllm_config,
+                                                     self.runner)
+        assert self.runner.drafter is mock_drafter
+        assert self.runner.rejection_sampler is not None
+
     def test_get_input_ids_embeds(self):
         """Tests _get_input_ids_embeds for both multimodal and text-only models."""
         # 1. ===== Setup =====
