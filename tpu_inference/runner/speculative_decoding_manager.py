@@ -24,6 +24,7 @@ from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 from tpu_inference.runner import utils as runner_utils
+from tpu_inference.spec_decode.jax.dflash import DFlashProposer
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 from tpu_inference.utils import device_array
 
@@ -83,6 +84,15 @@ class SpeculativeDecodingManager:
                 scheduler_output,
                 input_ids,
             )
+        elif self.runner.speculative_config.method == "dflash":
+            self._draft_token_ids = self.propose_dflash_draft_token_ids(
+                sampled_token_ids,
+                aux_hidden_states,
+                attn_metadata,
+                spec_decode_metadata,
+                scheduler_output,
+                input_ids,
+            )
         else:
             raise NotImplementedError(
                 f"Speculative decoding method "
@@ -98,7 +108,43 @@ class SpeculativeDecodingManager:
         input_ids: jnp.ndarray,
     ) -> list[list[int]]:
         assert isinstance(self.runner.drafter, Eagle3Proposer)
+        return self._propose_draft_token_ids_with_model(
+            sampled_token_ids,
+            aux_hidden_states,
+            attn_metadata,
+            spec_decode_metadata,
+            scheduler_output,
+            input_ids,
+        )
 
+    def propose_dflash_draft_token_ids(
+        self,
+        sampled_token_ids: list[list[int]],
+        aux_hidden_states: Optional[tuple[jnp.ndarray, ...]],
+        attn_metadata: AttentionMetadata,
+        spec_decode_metadata: Optional[SpecDecodeMetadata],
+        scheduler_output: VllmSchedulerOutput,
+        input_ids: jnp.ndarray,
+    ) -> list[list[int]]:
+        assert isinstance(self.runner.drafter, DFlashProposer)
+        return self._propose_draft_token_ids_with_model(
+            sampled_token_ids,
+            aux_hidden_states,
+            attn_metadata,
+            spec_decode_metadata,
+            scheduler_output,
+            input_ids,
+        )
+
+    def _propose_draft_token_ids_with_model(
+        self,
+        sampled_token_ids: list[list[int]],
+        aux_hidden_states: Optional[tuple[jnp.ndarray, ...]],
+        attn_metadata: AttentionMetadata,
+        spec_decode_metadata: Optional[SpecDecodeMetadata],
+        scheduler_output: VllmSchedulerOutput,
+        input_ids: jnp.ndarray,
+    ) -> list[list[int]]:
         # TODO(woosuk): Refactor the loop.
         req_ids = self.runner.input_batch.req_ids
         next_token_ids: list[int] = []
