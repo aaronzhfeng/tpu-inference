@@ -83,6 +83,16 @@ class SpeculativeDecodingManager:
                 scheduler_output,
                 input_ids,
             )
+        elif self.runner.speculative_config.method == "dflash":
+            # DFlash reuses the same propose flow as Eagle3
+            self._draft_token_ids = self.propose_eagle3_draft_token_ids(
+                sampled_token_ids,
+                aux_hidden_states,
+                attn_metadata,
+                spec_decode_metadata,
+                scheduler_output,
+                input_ids,
+            )
         else:
             raise NotImplementedError(
                 f"Speculative decoding method "
@@ -97,7 +107,9 @@ class SpeculativeDecodingManager:
         scheduler_output: VllmSchedulerOutput,
         input_ids: jnp.ndarray,
     ) -> list[list[int]]:
-        assert isinstance(self.runner.drafter, Eagle3Proposer)
+        # Supports both Eagle3Proposer and DFlashProposer (same interface)
+        assert hasattr(self.runner.drafter, 'prepare_inputs') and hasattr(
+            self.runner.drafter, 'propose')
 
         # TODO(woosuk): Refactor the loop.
         req_ids = self.runner.input_batch.req_ids

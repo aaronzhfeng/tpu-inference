@@ -598,6 +598,8 @@ class CompilationManager:
         self._precompile_rejection_sampler()
         if self.runner.speculative_config.method == "eagle3":
             self._precompile_eagle3_helpers()
+        # DFlash uses manual attention (no KV cache) and does not require
+        # the Eagle3-specific jit precompilation helpers.
 
     def _precompile_rejection_sampler(self) -> None:
         logger.info("Compiling rejection_sampler with different input shapes.")
