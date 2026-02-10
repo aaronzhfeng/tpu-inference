@@ -278,13 +278,25 @@ class Qwen3Model(Qwen2Model):
         return (2, num_layers // 2, num_layers - 3)
 
     def _get_dflash_aux_layers(self, vllm_config):
-        """Determine which target-model layers to capture for DFlash."""
+        """Determine which target-model layers to capture for DFlash.
+
+        DFlash's extract_context_feature uses hidden_states[layer_id + 1]
+        where hidden_states[0] is the embedding output and
+        hidden_states[k] is the output AFTER transformer layer k-1.
+        So target_layer_id=L means "output after layer L".
+
+        Our capture loop runs ``if i in aux_hidden_state_layers: append(x)``
+        BEFORE layer i, which gives the output of layer i-1.
+        Therefore we must shift each DFlash layer id by +1 so that
+        capturing "before layer L+1" == "after layer L".
+        """
         draft_hf_config = (
             vllm_config.speculative_config.draft_model_config.hf_config)
         dflash_config = getattr(draft_hf_config, "dflash_config", {})
         target_layer_ids = dflash_config.get("target_layer_ids", None)
         if target_layer_ids is not None:
-            return tuple(target_layer_ids)
+            # +1 because our loop captures BEFORE layer i (= after layer i-1)
+            return tuple(lid + 1 for lid in target_layer_ids)
 
         # Fall back to build_target_layer_ids logic
         num_target_layers = len(self.layers)
@@ -293,12 +305,12 @@ class Qwen3Model(Qwen2Model):
         num_selected = getattr(draft_hf_config, "num_target_layers",
                                num_draft_layers)
         if num_selected == 1:
-            return (num_target_layers // 2,)
+            return (num_target_layers // 2 + 1,)
         start = 1
         end = num_target_layers - 3
         span = end - start
         return tuple(
-            int(round(start + (i * span) / (num_selected - 1)))
+            int(round(start + (i * span) / (num_selected - 1))) + 1
             for i in range(num_selected)
         )
 

@@ -136,13 +136,18 @@ class DFlashAttention(nnx.Module):
         target_hidden: jax.Array,
         noise_positions: jax.Array,
         ctx_positions: jax.Array,
+        actual_ctx_len: jax.Array,
     ) -> jax.Array:
         """
         Args:
             x_noise: (T_noise, D) noise hidden states.
-            target_hidden: (T_ctx, D) projected context features.
+            target_hidden: (T_ctx_padded, D) projected context features
+                           (may be zero-padded beyond actual_ctx_len).
             noise_positions: (T_noise,) position ids for noise tokens.
-            ctx_positions: (T_ctx,) position ids for context tokens.
+            ctx_positions: (T_ctx_padded,) position ids for context tokens.
+            actual_ctx_len: scalar – number of real (non-padding) context
+                            tokens.  Positions beyond this are masked in
+                            the softmax.
 
         Returns:
             output: (T_noise, D) attention output.
@@ -173,9 +178,21 @@ class DFlashAttention(nnx.Module):
             k = jnp.repeat(k, self.num_kv_groups, axis=1)  # (S, N, H)
             v = jnp.repeat(v, self.num_kv_groups, axis=1)  # (S, N, H)
 
-        # Non-causal attention  (q over noise, k/v over ctx+noise)
+        # Attention scores
+        ctx_padded = target_hidden.shape[0]
+        total_kv = ctx_padded + x_noise.shape[0]
         scale = 1.0 / jnp.sqrt(jnp.float32(self.head_dim_original))
         attn_weights = jnp.einsum("tnh,snh->nts", q, k) * scale
+
+        # Mask out padding context positions so they don't steal
+        # softmax probability from real tokens.
+        # Real positions: [0..actual_ctx_len-1] and [ctx_padded..total_kv-1]
+        kv_idx = jnp.arange(total_kv)
+        kv_valid = (kv_idx < actual_ctx_len) | (kv_idx >= ctx_padded)
+        # Shape: (1, 1, total_kv) → broadcast over (N, T_noise, total_kv)
+        mask = kv_valid[jnp.newaxis, jnp.newaxis, :]
+        attn_weights = jnp.where(mask, attn_weights, jnp.finfo(q.dtype).min)
+
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
         attn_output = jnp.einsum("nts,snh->tnh", attn_weights, v)
 
@@ -252,10 +269,12 @@ class DFlashDecoderLayer(nnx.Module):
         target_hidden: jax.Array,
         noise_positions: jax.Array,
         ctx_positions: jax.Array,
+        actual_ctx_len: jax.Array,
     ) -> jax.Array:
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x, target_hidden, noise_positions, ctx_positions)
+        x = self.self_attn(
+            x, target_hidden, noise_positions, ctx_positions, actual_ctx_len)
         x = residual + x
 
         residual = x
@@ -431,16 +450,22 @@ class DFlashForCausalLM(nnx.Module):
 
         # Derive positions
         noise_positions = attention_metadata.input_positions  # (T_noise,)
-        ctx_len = target_hidden_states.shape[0]
+        ctx_padded = target_hidden_states.shape[0]
         first_noise_pos = noise_positions[0]
-        ctx_positions = jnp.arange(ctx_len) + jnp.maximum(
-            first_noise_pos - ctx_len, 0
+        ctx_positions = jnp.arange(ctx_padded) + jnp.maximum(
+            first_noise_pos - ctx_padded, 0
         )
+
+        # actual_ctx_len = first_noise_pos (noise starts right after context)
+        actual_ctx_len = first_noise_pos
 
         # Run through decoder layers
         x = noise_emb
         for layer in self.model.layers:
-            x = layer(x, target_hidden_states, noise_positions, ctx_positions)
+            x = layer(
+                x, target_hidden_states, noise_positions,
+                ctx_positions, actual_ctx_len,
+            )
 
         x = self.model.norm(x)
 
