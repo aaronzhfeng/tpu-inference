@@ -13,38 +13,38 @@
 # limitations under the License.
 """DFlash proposer for speculative decoding on JAX/TPU.
 
-Uses **torchax** to run the original PyTorch DFlash model on TPU,
-guaranteeing numerical equivalence with the GPU reference.
-
 DFlash is a block-diffusion draft model that produces an entire block of
-draft tokens in a single forward pass:
+draft tokens in a single forward pass.
 
-    noise_block  = [last_accepted_token, mask, mask, …, mask]  (block_size)
-    hidden       = draft_model(noise_block, context_hidden)    (block_size, D)
-    draft_ids    = argmax(lm_head(hidden[1:]))                 (block_size-1)
+Key design: the proposer maintains a **context accumulation buffer** that
+grows across speculative-decoding iterations, mimicking the PyTorch
+DynamicCache used in the original DFlash implementation.  On each iteration
+the newly-accepted tokens' projected hidden states are appended to the
+buffer so that the draft model always sees the full sequence history.
 """
 
+import functools
 from dataclasses import replace
 from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jax import lax
 from jax.sharding import NamedSharding, PartitionSpec
 from vllm.config import VllmConfig
 
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.logger import init_logger
-from tpu_inference.models.torchax.dflash_torchax import DFlashTorchaxWrapper
+from tpu_inference.models.common.model_loader import get_model
 from tpu_inference.utils import device_array
 
 logger = init_logger(__name__)
 
 
 class DFlashProposer:
-    """Proposer for speculative decoding using the DFlash block-diffusion
-    draft model, loaded via torchax."""
+    """Proposer for speculative decoding using DFlash block diffusion."""
 
     def __init__(
         self,
@@ -69,98 +69,156 @@ class DFlashProposer:
         )
         dflash_config = getattr(hf_config, "dflash_config", {})
         self.mask_token_id = dflash_config.get("mask_token_id", 0)
-        self.target_layer_ids = dflash_config.get("target_layer_ids", None)
+        self.hidden_size = hf_config.hidden_size
 
         self.rng_key = jax.random.key(self.vllm_config.model_config.seed)
         self.max_num_tokens = runner.max_num_tokens
+        self.max_model_len = runner.max_model_len
+
+        # ── Context accumulation buffer ──────────────────────────────
+        # Stores projected target hidden states (after fc + hidden_norm)
+        # across iterations so the draft model sees the full history.
+        # Shape: (max_model_len, hidden_size) – host-side NumPy array.
+        self._ctx_buf: Optional[np.ndarray] = None
+        self._ctx_len: int = 0  # valid entries in the buffer
 
     # ------------------------------------------------------------------
     # Model loading
     # ------------------------------------------------------------------
 
     def load_model(self, target_model: Any) -> None:
-        """Load the PyTorch DFlash model via torchax."""
-        draft_model_path = self.draft_model_config.model
+        """Load the DFlash draft model and share embeddings from target."""
+        (
+            self.model_fn,
+            self.compute_logits_fn,
+            self.combine_hidden_states_fn,
+            _,
+            self.state,
+            _,
+            _,
+        ) = get_model(
+            self.vllm_config, self.rng_key, self.mesh, is_draft_model=True
+        )
 
-        self.wrapper = DFlashTorchaxWrapper(self.mesh)
-        self.wrapper.load(draft_model_path, target_model)
+        # Share the target model's embedding with the draft model.
+        draft_embed = getattr(self.state.model, "embed_tokens", None)
+        target_embed = getattr(target_model.model, "embed_tokens", None)
+        if target_embed is None:
+            target_embed = getattr(target_model.model, "embed", None)
+        if target_embed is not None:
+            if draft_embed is None or not jnp.any(draft_embed.embedding):
+                logger.info(
+                    "Sharing target model embedding with DFlash draft model."
+                )
+                self.state.model.embed_tokens = target_embed
+            elif jnp.array_equal(
+                draft_embed.embedding, target_embed.embedding
+            ):
+                logger.info(
+                    "Draft embedding identical to target; sharing."
+                )
+                self.state.model.embed_tokens = target_embed
 
-        # Build JIT-compiled callables
-        self._draft_forward_fn = self.wrapper.get_draft_forward_fn()
-        self._combine_fn = self.wrapper.get_combine_hidden_fn()
-        self._logits_fn = self.wrapper.get_compute_logits_fn()
+    # ------------------------------------------------------------------
+    # Context buffer management (host-side, outside JIT)
+    # ------------------------------------------------------------------
 
-        self.params = self.wrapper.params
-        self.embed_weight = self.wrapper.embed_weight_jax
+    def _project_aux_hidden(
+        self, aux_hidden_states: tuple[jax.Array, ...]
+    ) -> jax.Array:
+        """Project & normalise auxiliary hidden states (JIT-compiled)."""
+        raw = jnp.concatenate(aux_hidden_states, axis=-1)
+        return self.combine_hidden_states_fn(self.state, raw)
 
-        logger.info("DFlash proposer loaded (torchax).")
+    def _update_context_buffer(
+        self,
+        projected: jax.Array,
+        seq_len: int,
+    ) -> None:
+        """Append newly-accepted projected hidden states to the buffer.
+
+        Args:
+            projected: (padded_T, D) freshly projected context from the
+                       latest target forward.  Only the first ``num_new``
+                       entries are real (rest is padding).
+            seq_len:   Current total sequence length after this target
+                       forward (= number of valid context tokens so far).
+        """
+        proj_np = np.asarray(projected)
+
+        if self._ctx_buf is None:
+            # First call: allocate the fixed-size buffer.
+            self._ctx_buf = np.zeros(
+                (self.max_model_len, proj_np.shape[-1]),
+                dtype=proj_np.dtype,
+            )
+
+        num_new = seq_len - self._ctx_len
+        if num_new <= 0:
+            # Possible after full rejection – nothing to append.
+            # Just crop to seq_len (discard tokens beyond accepted prefix).
+            self._ctx_len = seq_len
+            return
+
+        # Copy the first `num_new` real entries from the projection into
+        # the buffer right after the existing context.
+        end = min(self._ctx_len + num_new, self.max_model_len)
+        n_copy = end - self._ctx_len
+        self._ctx_buf[self._ctx_len : end] = proj_np[:n_copy]
+        self._ctx_len = end
+
+    @staticmethod
+    def _next_padded_size(n: int) -> int:
+        """Round *n* up to the next power-of-two (min 16)."""
+        if n <= 16:
+            return 16
+        p = 16
+        while p < n:
+            p *= 2
+        return p
+
+    def _get_context_jax(self) -> jax.Array:
+        """Return accumulated context padded to a power-of-two length.
+
+        Padding to a fixed set of sizes (16, 32, 64, …) means the JIT-
+        compiled model function only needs to be traced once per bucket,
+        eliminating the costly retrace-per-token that made the previous
+        version slow.
+        """
+        padded = self._next_padded_size(self._ctx_len)
+        padded = min(padded, self.max_model_len)
+        # Slice the pre-allocated buffer and return exactly `padded` rows.
+        # Rows beyond _ctx_len are already zero.
+        return device_array(self.mesh, self._ctx_buf[:padded])
 
     # ------------------------------------------------------------------
     # Input preparation
     # ------------------------------------------------------------------
 
-    def _build_noise_block_and_context(
+    @functools.partial(jax.jit, static_argnums=(0, 3, 4))
+    def _build_noise_block(
         self,
-        aux_hidden_states: tuple[jax.Array, ...],
+        seq_len_arr: jax.Array,
         next_token_ids: jax.Array,
-        seq_len: int,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Build the DFlash context/noise inputs for one active request.
+        mask_token_id: int,
+        block_size: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Build noise block and positions (JIT-compiled).
 
+        Args:
+            seq_len_arr: (1,) array containing the current sequence length.
         Returns:
-            raw_target_hidden: (T_ctx, num_layers * D) concatenated (NOT
-                               projected – projection happens inside the
-                               PyTorch model via fc + hidden_norm).
-            noise_input_ids:   (block_size,) [next_token, mask, …, mask].
-            position_ids:      (T_ctx + block_size,) for RoPE.
+            noise_input_ids: (block_size,) [next_token, mask, …].
+            noise_positions: (block_size,) [seq_len, seq_len+1, …].
         """
-        # Trim to real (non-padded) context length before concatenation.
-        trimmed_hidden = [h[:seq_len] for h in aux_hidden_states]
-        raw_target_hidden = jnp.concatenate(trimmed_hidden, axis=-1)
-
-        # Noise block
+        seq_len = seq_len_arr[0]
         first_token = next_token_ids[0]
-        noise_input_ids = jnp.full((self.block_size,), self.mask_token_id,
-                                   dtype=jnp.int32)
-        noise_input_ids = noise_input_ids.at[0].set(first_token)
-
-        # Position IDs: [0 .. ctx_len-1, ctx_len .. ctx_len+block_size-1].
-        total_len = int(seq_len) + int(self.block_size)
-        position_ids = jnp.arange(total_len, dtype=jnp.int32)
-
-        return raw_target_hidden, noise_input_ids, position_ids
-
-    def _resolve_context_seq_len(
-        self,
-        attn_metadata: AttentionMetadata,
-        aux_hidden_states: tuple[jax.Array, ...],
-        num_rejected_tokens: Optional[jax.Array],
-    ) -> int:
-        """Resolve true context length for DFlash input construction.
-
-        The runner metadata for speculative steps still reflects scheduled
-        query tokens before rejection. For DFlash, we must trim rejected tail
-        tokens so the next draft sees only accepted+bonus context.
-        """
-        seq_lens_cpu = np.asarray(jax.device_get(attn_metadata.seq_lens)).astype(
-            np.int32
+        noise_input_ids = jnp.full(
+            (block_size,), mask_token_id, dtype=jnp.int32
         )
-        if seq_lens_cpu.size == 0:
-            raise RuntimeError("DFlash expected non-empty seq_lens metadata.")
-
-        seq_len = int(seq_lens_cpu[0])
-        if num_rejected_tokens is not None:
-            rejected_cpu = np.asarray(jax.device_get(num_rejected_tokens)).astype(
-                np.int32
-            )
-            if rejected_cpu.size > 0:
-                seq_len -= int(rejected_cpu[0])
-
-        # Keep at least one token (the current accepted token).
-        seq_len = max(1, seq_len)
-        # Defensive clamp to actual hidden-state buffer length.
-        max_ctx = min(int(h.shape[0]) for h in aux_hidden_states)
-        return min(seq_len, max_ctx)
+        noise_input_ids = noise_input_ids.at[0].set(first_token)
+        noise_positions = jnp.arange(block_size, dtype=jnp.int32) + seq_len
+        return noise_input_ids, noise_positions
 
     def prepare_inputs(
         self,
@@ -170,18 +228,41 @@ class DFlashProposer:
         next_token_ids: jax.Array,
         num_rejected_tokens: Optional[jax.Array] = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, AttentionMetadata]:
-        """Prepare DFlash-specific inputs.
+        """Prepare DFlash inputs with accumulated context.
 
-        Returns a 4-tuple for API compatibility with the Eagle3 flow:
-            (raw_target_hidden, noise_input_ids, position_ids, attn_metadata)
-        The 3rd element is position_ids (not last_token_indices).
+        Returns:
+            target_hidden  – (ctx_len, D) accumulated projected context.
+            noise_ids      – (block_size,) noise block token IDs.
+            dummy_indices  – unused, kept for API compat.
+            draft_metadata – attention metadata with noise positions.
         """
         assert aux_hidden_states is not None and len(aux_hidden_states) > 0
-        if self.runner.input_batch.num_reqs != 1:
-            raise NotImplementedError(
-                "DFlash torchax proposer currently supports max_num_seqs=1."
-            )
 
+        # 1. Determine current sequence length.
+        seq_len_jax = attn_metadata.seq_lens[0]
+        seq_len = int(jax.device_get(seq_len_jax))
+
+        # 2. Project the new auxiliary hidden states.
+        projected = self._project_aux_hidden(aux_hidden_states)
+
+        # 3. Update the accumulation buffer.
+        self._update_context_buffer(projected, seq_len)
+
+        # 4. Build noise block & positions.
+        seq_len_arr = device_array(
+            self.mesh, np.array([seq_len], dtype=np.int32)
+        )
+        noise_input_ids, noise_positions = self._build_noise_block(
+            seq_len_arr,
+            next_token_ids,
+            self.mask_token_id,
+            self.block_size,
+        )
+
+        # 5. Convert accumulated context to JAX array.
+        target_hidden = self._get_context_jax()
+
+        # 6. Build draft attention metadata.
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
         block_tables = (
@@ -189,29 +270,21 @@ class DFlashProposer:
             .get_cpu_tensor()
             .reshape(-1)
         )
-
-        seq_len = self._resolve_context_seq_len(
-            attn_metadata,
-            aux_hidden_states,
-            num_rejected_tokens,
-        )
-        raw_target_hidden, noise_input_ids, position_ids = (
-            self._build_noise_block_and_context(
-                aux_hidden_states,
-                next_token_ids,
-                seq_len,
-            )
-        )
-
+        num_reqs = attn_metadata.seq_lens.shape[0]
         draft_attn_metadata = replace(
             attn_metadata,
+            input_positions=noise_positions,
+            query_start_loc=jnp.array(
+                [0, self.block_size], dtype=jnp.int32
+            ),
             block_tables=device_array(self.mesh, block_tables),
         )
 
+        dummy_last_indices = jnp.zeros(num_reqs, dtype=jnp.int32)
         return (
-            raw_target_hidden,
+            target_hidden,
             noise_input_ids,
-            position_ids,
+            dummy_last_indices,
             draft_attn_metadata,
         )
 
@@ -219,58 +292,48 @@ class DFlashProposer:
     # Draft token generation
     # ------------------------------------------------------------------
 
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _sample_block_draft_tokens(
+        self,
+        state: nnx.State,
+        hidden_states: jax.Array,
+    ) -> jax.Array:
+        """Greedy-sample draft tokens from the block output.
+
+        Args:
+            hidden_states: (block_size, D) full block output.
+        Returns:
+            (num_speculative_tokens,) draft token IDs.
+        """
+        draft_hidden = hidden_states[1 : 1 + self.num_speculative_tokens]
+        logits = self.compute_logits_fn(state, draft_hidden, None)
+        draft_ids = jnp.argmax(logits, axis=-1)
+        return lax.with_sharding_constraint(
+            draft_ids, NamedSharding(self.mesh, PartitionSpec())
+        )
+
     def propose(
         self,
         kv_caches: list[jax.Array],
-        input_ids: jax.Array,       # noise_input_ids from prepare_inputs
+        input_ids: jax.Array,
         attn_metadata: AttentionMetadata,
-        last_token_indices: jax.Array,  # actually position_ids
-        target_hidden_states: jax.Array,  # raw_target_hidden
-    ) -> tuple[list[jax.Array], jnp.ndarray, jnp.ndarray]:
-        """Generate all draft tokens in one forward pass via torchax.
-
-        Returns:
-            (kv_caches, draft_token_ids, draft_token_probs) where
-            `draft_token_ids` has shape (1, num_speculative_tokens) and
-            `draft_token_probs` has shape (1, num_speculative_tokens).
-        """
-        position_ids = last_token_indices  # repurposed from API slot
-
-        # Run the PyTorch DFlash model through torchax.
-        hidden_states = self._draft_forward_fn(
-            self.params,
-            input_ids,             # (block_size,)
-            target_hidden_states,  # (ctx_len, num_layers * D)
-            position_ids,          # (ctx_len + block_size,)
-            self.embed_weight,     # (vocab_size, D)
-        )
-        # hidden_states: (block_size, D)
-
-        # Take positions 1..block_size-1 → num_speculative_tokens predictions
-        draft_hidden = hidden_states[1: 1 + self.num_speculative_tokens]
-
-        # compute logits via tied embeddings
-        logits = self._logits_fn(
-            self.params,
-            draft_hidden,
-            self.embed_weight,
+        last_token_indices: jax.Array,
+        target_hidden_states: jax.Array,
+    ) -> tuple[list[jax.Array], jnp.ndarray]:
+        """Generate all draft tokens in one forward pass."""
+        kv_caches, hidden_states, _aux = self.model_fn(
+            self.state,
+            kv_caches,
+            input_ids,
+            target_hidden_states,
+            attn_metadata,
         )
 
-        draft_token_ids = jnp.argmax(logits, axis=-1)
-        draft_log_probs = jax.nn.log_softmax(logits.astype(jnp.float32),
-                                             axis=-1)
-        draft_token_probs = jnp.take_along_axis(
-            draft_log_probs, draft_token_ids[:, None], axis=-1).squeeze(-1)
-        draft_token_probs = jnp.exp(draft_token_probs)
-        draft_token_ids = lax.with_sharding_constraint(
-            draft_token_ids, NamedSharding(self.mesh, PartitionSpec()))
-        draft_token_probs = lax.with_sharding_constraint(
-            draft_token_probs, NamedSharding(self.mesh, PartitionSpec()))
+        draft_token_ids = self._sample_block_draft_tokens(
+            self.state, hidden_states
+        )
 
-        # Framework expects (num_reqs, num_speculative_tokens)
         if draft_token_ids.ndim == 1:
             draft_token_ids = draft_token_ids[jnp.newaxis, :]
-        if draft_token_probs.ndim == 1:
-            draft_token_probs = draft_token_probs[jnp.newaxis, :]
 
-        return kv_caches, draft_token_ids, draft_token_probs
+        return kv_caches, draft_token_ids

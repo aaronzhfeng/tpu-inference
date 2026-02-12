@@ -139,8 +139,10 @@ class KVCacheManager:
                     hf_config.num_key_value_heads, model_cnt)
                 head_size = common_utils.get_padded_head_dim(
                     hf_config.hidden_size // hf_config.num_attention_heads)
-                # Eagle3 has 1 layer; DFlash may have more but doesn't
-                # use KV caches -- allocate 1 dummy layer for framework compat.
+                # Eagle3 has 1 decoder layer and uses the paged KV cache.
+                # DFlash uses a proposer-managed context accumulation
+                # buffer instead of the framework's paged KV cache, so we
+                # allocate 1 dummy layer for framework compatibility.
                 draft_num_layers = 1
                 for i in range(draft_num_layers):
                     if self.use_mla:
