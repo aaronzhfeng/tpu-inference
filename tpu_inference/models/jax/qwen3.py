@@ -265,6 +265,7 @@ class Qwen3Model(Qwen2Model):
 
         # Auxiliary hidden-state layers for speculative decoding (Eagle3, DFlash, etc.)
         self.aux_hidden_state_layers = []
+        self.capture_aux_after_layer = False
         if vllm_config.speculative_config:
             method = getattr(vllm_config.speculative_config, "method", None)
             if method == "eagle3":
@@ -272,6 +273,9 @@ class Qwen3Model(Qwen2Model):
             elif method == "dflash":
                 self.aux_hidden_state_layers = self._get_dflash_aux_layers(
                     vllm_config)
+                # DFlash reference extracts hidden_states[layer_id + 1],
+                # i.e. post-layer activations.
+                self.capture_aux_after_layer = True
 
     def _get_eagle3_aux_layers(self):
         num_layers = len(self.layers)
@@ -317,7 +321,8 @@ class Qwen3Model(Qwen2Model):
         aux_hidden_states = []
         for i, layer in enumerate(
                 islice(self.layers, self.start_layer, self.end_layer)):
-            if i in self.aux_hidden_state_layers:
+            if (not self.capture_aux_after_layer
+                    and i in self.aux_hidden_state_layers):
                 aux_hidden_states.append(x)
             kv_cache = kv_caches[i]
             kv_cache, x = layer(
@@ -326,6 +331,8 @@ class Qwen3Model(Qwen2Model):
                 attention_metadata,
             )
             kv_caches[i] = kv_cache
+            if self.capture_aux_after_layer and i in self.aux_hidden_state_layers:
+                aux_hidden_states.append(x)
         x = self.norm(x)
         return kv_caches, x, aux_hidden_states
 

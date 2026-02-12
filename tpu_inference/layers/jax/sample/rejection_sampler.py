@@ -59,6 +59,8 @@ class RejectionSampler:
         bonus_token_ids: jnp.ndarray,
         sampling_metadata: TPUSupportedSamplingMetadata,
         key: Optional[jax.random.PRNGKey] = None,
+        # [num_tokens] - probability of each drafted token under draft model
+        draft_token_probs: Optional[jnp.ndarray] = None,
     ) -> jnp.ndarray:
         """
         Perform rejection sampling on draft tokens with flattened inputs.
@@ -67,10 +69,12 @@ class RejectionSampler:
             draft_token_ids: Draft token IDs in flattened format [num_tokens].
             num_draft_tokens: Number of draft tokens per request [batch_size].
             draft_probs: Draft probabilities in flattened format [num_tokens, vocab_size].
+            draft_token_probs: Probability of drafted token IDs [num_tokens].
             target_probs: Target probabilities in flattened format [num_tokens, vocab_size].
             bonus_token_ids: Bonus token IDs [batch_size].
             sampling_metadata: Additional metadata needed for sampling.
             key: JAX random key for non-greedy sampling.
+            draft_token_probs: Probability of drafted token IDs [num_tokens].
 
         Returns:
             output_token_ids: A tensor containing the final output token IDs.
@@ -79,6 +83,7 @@ class RejectionSampler:
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens,
             draft_probs=draft_probs,
+            draft_token_probs=draft_token_probs,
             target_logits=target_logits,
             bonus_token_ids=bonus_token_ids,
             sampling_metadata=sampling_metadata,
@@ -100,6 +105,8 @@ class RejectionSampler:
         bonus_token_ids: jnp.ndarray,
         sampling_metadata: TPUSupportedSamplingMetadata,
         key: Optional[jax.random.PRNGKey] = None,
+        # [num_tokens] - probability of each drafted token under draft model
+        draft_token_probs: Optional[jnp.ndarray] = None,
     ) -> jnp.ndarray:
         """
         Perform rejection sampling on draft tokens with flattened inputs.
@@ -108,10 +115,12 @@ class RejectionSampler:
             draft_token_ids: Draft token IDs in flattened format [num_tokens].
             num_draft_tokens: Number of draft tokens per request [batch_size].
             draft_probs: Draft probabilities in flattened format [num_tokens, vocab_size].
+            draft_token_probs: Probability of drafted token IDs [num_tokens].
             target_logits: Target logits in flattened format [num_tokens, vocab_size].
             bonus_token_ids: Bonus token IDs [batch_size].
             sampling_metadata: Additional metadata needed for sampling.
             key: JAX random key for non-greedy sampling.
+            draft_token_probs: Probability of drafted token IDs [num_tokens].
 
         Returns:
             output_token_ids: A tensor containing the final output token IDs.
@@ -131,6 +140,7 @@ class RejectionSampler:
             bonus_token_ids,
             sampling_metadata,
             key=key,
+            draft_token_probs=draft_token_probs,
         )
         return output_token_ids
 
@@ -296,6 +306,8 @@ def rejection_sample(
     bonus_token_ids: jnp.ndarray,
     sampling_metadata: TPUSupportedSamplingMetadata,
     key: Optional[jax.random.PRNGKey] = None,
+    # [num_tokens]
+    draft_token_probs: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """
     Perform rejection sampling on draft tokens with flattened inputs.
@@ -304,10 +316,12 @@ def rejection_sample(
         draft_token_ids: Draft token IDs in flattened format [num_tokens].
         num_draft_tokens: Number of draft tokens per request [batch_size].
         draft_probs: Draft probabilities in flattened format [num_tokens, vocab_size].
+        draft_token_probs: Probability of drafted token IDs [num_tokens].
         target_probs: Target probabilities in flattened format [num_tokens, vocab_size].
         bonus_token_ids: Bonus token IDs [batch_size].
         sampling_metadata: Sampling metadata.
         key: JAX random key for non-greedy sampling.
+        draft_token_probs: Probability of drafted token IDs [num_tokens].
 
     Returns:
         output_token_ids: Output token IDs [num_tokens + batch_size].
@@ -329,6 +343,7 @@ def rejection_sample(
         num_draft_tokens,
         bonus_token_ids,
         key,
+        draft_token_probs=draft_token_probs,
     )
 
     return random_output
@@ -341,6 +356,7 @@ def _random_rejection_sample_with_segment(
     num_draft_tokens: jax.Array,
     bonus_token_ids: jax.Array,
     key: jax.random.PRNGKey,
+    draft_token_probs: Optional[jax.Array] = None,
 ) -> jax.Array:
     """
     Performs random speculative decoding validation in a vectorized, jittable manner.
@@ -357,11 +373,12 @@ def _random_rejection_sample_with_segment(
 
     # --- Step 2: Acceptance/Rejection Logic ---
     if draft_probs is not None:
-        draft_token_probs = jnp.take_along_axis(draft_probs,
-                                                draft_token_ids[:, None],
-                                                axis=-1).squeeze(-1)
+        draft_token_prob_values = jnp.take_along_axis(
+            draft_probs, draft_token_ids[:, None], axis=-1).squeeze(-1)
+    elif draft_token_probs is not None:
+        draft_token_prob_values = draft_token_probs
     else:
-        draft_token_probs = 1.0
+        draft_token_prob_values = 1.0
 
     target_token_probs = jnp.take_along_axis(target_probs,
                                              draft_token_ids[:, None],
@@ -370,7 +387,7 @@ def _random_rejection_sample_with_segment(
     uniform_probs = jax.random.uniform(uniform_key, shape=(total_tokens, ))
 
     # Acceptance condition: p_target(d) / p_draft(d) >= u
-    ratio = target_token_probs / (draft_token_probs + 1e-9)
+    ratio = target_token_probs / (draft_token_prob_values + 1e-9)
     accepted = ratio >= uniform_probs
 
     # --- Step 3: Find First Rejection ---

@@ -863,6 +863,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 draft_token_ids=spec_decode_metadata.draft_token_ids,
                 num_draft_tokens=spec_decode_metadata.draft_lengths,
                 draft_probs=None,
+                draft_token_probs=spec_decode_metadata.draft_token_probs,
                 target_logits=target_logits,
                 bonus_token_ids=bonus_token_ids,
                 sampling_metadata=tpu_sampling_metadata,

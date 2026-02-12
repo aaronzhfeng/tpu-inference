@@ -24,7 +24,6 @@ draft tokens in a single forward pass:
     draft_ids    = argmax(lm_head(hidden[1:]))                 (block_size-1)
 """
 
-import functools
 from dataclasses import replace
 from typing import Any, Optional
 
@@ -100,16 +99,13 @@ class DFlashProposer:
     # Input preparation
     # ------------------------------------------------------------------
 
-    @functools.partial(jax.jit, static_argnums=(0, 4, 5))
     def _build_noise_block_and_context(
         self,
         aux_hidden_states: tuple[jax.Array, ...],
-        seq_lens: jax.Array,
         next_token_ids: jax.Array,
-        mask_token_id: int,
-        block_size: int,
+        seq_len: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Build noise block, combine raw aux hidden states, derive positions.
+        """Build the DFlash context/noise inputs for one active request.
 
         Returns:
             raw_target_hidden: (T_ctx, num_layers * D) concatenated (NOT
@@ -118,29 +114,53 @@ class DFlashProposer:
             noise_input_ids:   (block_size,) [next_token, mask, …, mask].
             position_ids:      (T_ctx + block_size,) for RoPE.
         """
-        # Concatenate aux hidden states from different target layers
-        raw_target_hidden = jnp.concatenate(aux_hidden_states, axis=-1)
+        # Trim to real (non-padded) context length before concatenation.
+        trimmed_hidden = [h[:seq_len] for h in aux_hidden_states]
+        raw_target_hidden = jnp.concatenate(trimmed_hidden, axis=-1)
 
         # Noise block
-        seq_len = seq_lens[0]
         first_token = next_token_ids[0]
-        noise_input_ids = jnp.full((block_size,), mask_token_id,
+        noise_input_ids = jnp.full((self.block_size,), self.mask_token_id,
                                    dtype=jnp.int32)
         noise_input_ids = noise_input_ids.at[0].set(first_token)
 
         # Position IDs: [0 .. ctx_len-1, ctx_len .. ctx_len+block_size-1].
-        # Use int32 – JAX on TPU truncates int64 anyway.
-        ctx_len = raw_target_hidden.shape[0]
-        total_len = ctx_len + block_size
+        total_len = int(seq_len) + int(self.block_size)
         position_ids = jnp.arange(total_len, dtype=jnp.int32)
 
-        # Zero out padding entries (>= seq_len) so they contribute ~zero
-        # to the attention computation.
-        ctx_mask = (jnp.arange(ctx_len) < seq_len).astype(
-            raw_target_hidden.dtype)
-        raw_target_hidden = raw_target_hidden * ctx_mask[:, None]
-
         return raw_target_hidden, noise_input_ids, position_ids
+
+    def _resolve_context_seq_len(
+        self,
+        attn_metadata: AttentionMetadata,
+        aux_hidden_states: tuple[jax.Array, ...],
+        num_rejected_tokens: Optional[jax.Array],
+    ) -> int:
+        """Resolve true context length for DFlash input construction.
+
+        The runner metadata for speculative steps still reflects scheduled
+        query tokens before rejection. For DFlash, we must trim rejected tail
+        tokens so the next draft sees only accepted+bonus context.
+        """
+        seq_lens_cpu = np.asarray(jax.device_get(attn_metadata.seq_lens)).astype(
+            np.int32
+        )
+        if seq_lens_cpu.size == 0:
+            raise RuntimeError("DFlash expected non-empty seq_lens metadata.")
+
+        seq_len = int(seq_lens_cpu[0])
+        if num_rejected_tokens is not None:
+            rejected_cpu = np.asarray(jax.device_get(num_rejected_tokens)).astype(
+                np.int32
+            )
+            if rejected_cpu.size > 0:
+                seq_len -= int(rejected_cpu[0])
+
+        # Keep at least one token (the current accepted token).
+        seq_len = max(1, seq_len)
+        # Defensive clamp to actual hidden-state buffer length.
+        max_ctx = min(int(h.shape[0]) for h in aux_hidden_states)
+        return min(seq_len, max_ctx)
 
     def prepare_inputs(
         self,
@@ -157,6 +177,10 @@ class DFlashProposer:
         The 3rd element is position_ids (not last_token_indices).
         """
         assert aux_hidden_states is not None and len(aux_hidden_states) > 0
+        if self.runner.input_batch.num_reqs != 1:
+            raise NotImplementedError(
+                "DFlash torchax proposer currently supports max_num_seqs=1."
+            )
 
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
@@ -166,13 +190,16 @@ class DFlashProposer:
             .reshape(-1)
         )
 
+        seq_len = self._resolve_context_seq_len(
+            attn_metadata,
+            aux_hidden_states,
+            num_rejected_tokens,
+        )
         raw_target_hidden, noise_input_ids, position_ids = (
             self._build_noise_block_and_context(
                 aux_hidden_states,
-                attn_metadata.seq_lens,
                 next_token_ids,
-                self.mask_token_id,
-                self.block_size,
+                seq_len,
             )
         )
 
@@ -199,12 +226,13 @@ class DFlashProposer:
         attn_metadata: AttentionMetadata,
         last_token_indices: jax.Array,  # actually position_ids
         target_hidden_states: jax.Array,  # raw_target_hidden
-    ) -> tuple[list[jax.Array], jnp.ndarray]:
+    ) -> tuple[list[jax.Array], jnp.ndarray, jnp.ndarray]:
         """Generate all draft tokens in one forward pass via torchax.
 
         Returns:
-            (kv_caches, draft_token_ids)  where draft_token_ids has shape
-            (1, num_speculative_tokens).
+            (kv_caches, draft_token_ids, draft_token_probs) where
+            `draft_token_ids` has shape (1, num_speculative_tokens) and
+            `draft_token_probs` has shape (1, num_speculative_tokens).
         """
         position_ids = last_token_indices  # repurposed from API slot
 
@@ -229,11 +257,20 @@ class DFlashProposer:
         )
 
         draft_token_ids = jnp.argmax(logits, axis=-1)
+        draft_log_probs = jax.nn.log_softmax(logits.astype(jnp.float32),
+                                             axis=-1)
+        draft_token_probs = jnp.take_along_axis(
+            draft_log_probs, draft_token_ids[:, None], axis=-1).squeeze(-1)
+        draft_token_probs = jnp.exp(draft_token_probs)
         draft_token_ids = lax.with_sharding_constraint(
             draft_token_ids, NamedSharding(self.mesh, PartitionSpec()))
+        draft_token_probs = lax.with_sharding_constraint(
+            draft_token_probs, NamedSharding(self.mesh, PartitionSpec()))
 
         # Framework expects (num_reqs, num_speculative_tokens)
         if draft_token_ids.ndim == 1:
             draft_token_ids = draft_token_ids[jnp.newaxis, :]
+        if draft_token_probs.ndim == 1:
+            draft_token_probs = draft_token_probs[jnp.newaxis, :]
 
-        return kv_caches, draft_token_ids
+        return kv_caches, draft_token_ids, draft_token_probs
