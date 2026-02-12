@@ -681,8 +681,11 @@ class CompilationManager:
                         _cache_collision_dummy,
                         NamedSharding(self.runner.mesh, PartitionSpec(None)))
 
+                    draft_token_probs = None
                     if do_sampling:
                         compilation_name = "random_rejection_sampler"
+                        draft_token_probs = self._create_dummy_tensor(
+                            (num_logits, ), np.float32)
                         temperature = self._create_dummy_tensor((num_reqs, ),
                                                                 np.float32)
                         top_k = self._create_dummy_tensor((num_reqs, ),
@@ -711,6 +714,7 @@ class CompilationManager:
                         bonus_token_ids,
                         sampling_metadata,
                         self.runner.rng_params_for_sampling,
+                        draft_token_probs,
                         num_logits=num_logits,
                         num_reqs=num_reqs,
                         do_sampling=do_sampling,
