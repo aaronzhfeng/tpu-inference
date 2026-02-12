@@ -596,8 +596,10 @@ class CompilationManager:
         logger.info(
             "Compiling speculative_decoding with different input shapes.")
         self._precompile_rejection_sampler()
-        if self.runner.speculative_config.method in ("eagle3", "dflash"):
+        if self.runner.speculative_config.method == "eagle3":
             self._precompile_eagle3_helpers()
+        # DFlash uses manual attention (no KV cache) and does not require
+        # the Eagle3-specific jit precompilation helpers.
 
     def _precompile_rejection_sampler(self) -> None:
         logger.info("Compiling rejection_sampler with different input shapes.")
@@ -658,13 +660,6 @@ class CompilationManager:
         target_hidden_size = self.runner.model_config.get_hidden_size()
         draft_hidden_size = self.runner.speculative_config.draft_model_config.get_hidden_size(
         )
-        num_aux_hidden_states = 3
-        if self.runner.speculative_config.method == "dflash":
-            target_layer_ids = getattr(
-                getattr(self.runner.drafter.state, "model", None),
-                "target_layer_ids", None)
-            if target_layer_ids:
-                num_aux_hidden_states = len(target_layer_ids)
         dtype = self.runner.model_config.dtype
 
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
@@ -733,8 +728,11 @@ class CompilationManager:
         for num_tokens in self.runner.num_tokens_paddings:
             aux_hidden_states = [
                 self._create_dummy_tensor((num_tokens, target_hidden_size),
-                                          dtype)
-                for _ in range(num_aux_hidden_states)
+                                          dtype),
+                self._create_dummy_tensor((num_tokens, target_hidden_size),
+                                          dtype),
+                self._create_dummy_tensor((num_tokens, target_hidden_size),
+                                          dtype),
             ]
 
             positions = self._create_dummy_tensor((num_tokens, ), jnp.int32)
@@ -766,8 +764,16 @@ class CompilationManager:
             aux_hidden_states = [
                 self._create_dummy_tensor(
                     (num_tokens, target_hidden_size), jnp.bfloat16,
-                    NamedSharding(self.runner.mesh, PartitionSpec(None, None)))
-                for _ in range(num_aux_hidden_states)
+                    NamedSharding(self.runner.mesh, PartitionSpec(None,
+                                                                  None))),
+                self._create_dummy_tensor(
+                    (num_tokens, target_hidden_size), jnp.bfloat16,
+                    NamedSharding(self.runner.mesh, PartitionSpec(None,
+                                                                  None))),
+                self._create_dummy_tensor(
+                    (num_tokens, target_hidden_size), jnp.bfloat16,
+                    NamedSharding(self.runner.mesh, PartitionSpec(None,
+                                                                  None))),
             ]
             # TODO(ranlihao): This will increase the precompilation latency. Find proper range for token_indices.
             for padded_total_num_tokens in [

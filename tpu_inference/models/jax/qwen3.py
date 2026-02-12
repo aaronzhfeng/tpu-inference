@@ -47,37 +47,6 @@ logger = init_logger(__name__)
 init_fn = nnx.initializers.uniform()
 
 
-def _build_target_layer_ids(num_target_layers: int,
-                            num_draft_layers: int) -> list[int]:
-    if num_draft_layers <= 1:
-        return [num_target_layers // 2]
-    start = 1
-    end = max(start, num_target_layers - 3)
-    span = end - start
-    return [
-        int(round(start + (i * span) / (num_draft_layers - 1)))
-        for i in range(num_draft_layers)
-    ]
-
-
-def _get_dflash_target_layer_ids(target_num_layers: int,
-                                 draft_hf_config: Qwen3Config) -> list[int]:
-    cfg = getattr(draft_hf_config, "dflash_config", None)
-    if isinstance(cfg, dict):
-        layer_ids = cfg.get("target_layer_ids", None)
-        if layer_ids:
-            return [int(x) for x in layer_ids]
-    elif cfg is not None and hasattr(cfg, "target_layer_ids"):
-        layer_ids = getattr(cfg, "target_layer_ids")
-        if layer_ids:
-            return [int(x) for x in layer_ids]
-
-    num_target_layers = int(
-        getattr(draft_hf_config, "num_target_layers", target_num_layers))
-    num_draft_layers = int(getattr(draft_hf_config, "num_hidden_layers", 1))
-    return _build_target_layer_ids(num_target_layers, num_draft_layers)
-
-
 class Qwen3Attention(JaxModule):
 
     def __init__(self, config: Qwen3Config, dtype: jnp.dtype, rng: nnx.Rngs,
@@ -294,13 +263,44 @@ class Qwen3Model(Qwen2Model):
         else:
             self.norm = PPMissingLayer()
 
-        self.aux_hidden_state_layers: tuple[int, ...] = ()
-        if vllm_config.speculative_config and vllm_config.speculative_config.method == "dflash":
-            draft_hf_config = (
-                vllm_config.speculative_config.draft_model_config.hf_config)
-            self.aux_hidden_state_layers = tuple(
-                _get_dflash_target_layer_ids(hf_config.num_hidden_layers,
-                                             draft_hf_config))
+        # Auxiliary hidden-state layers for speculative decoding (Eagle3, DFlash, etc.)
+        self.aux_hidden_state_layers = []
+        if vllm_config.speculative_config:
+            method = getattr(vllm_config.speculative_config, "method", None)
+            if method == "eagle3":
+                self.aux_hidden_state_layers = self._get_eagle3_aux_layers()
+            elif method == "dflash":
+                self.aux_hidden_state_layers = self._get_dflash_aux_layers(
+                    vllm_config)
+
+    def _get_eagle3_aux_layers(self):
+        num_layers = len(self.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
+    def _get_dflash_aux_layers(self, vllm_config):
+        """Determine which target-model layers to capture for DFlash."""
+        draft_hf_config = (
+            vllm_config.speculative_config.draft_model_config.hf_config)
+        dflash_config = getattr(draft_hf_config, "dflash_config", {})
+        target_layer_ids = dflash_config.get("target_layer_ids", None)
+        if target_layer_ids is not None:
+            return tuple(target_layer_ids)
+
+        # Fall back to build_target_layer_ids logic
+        num_target_layers = len(self.layers)
+        num_draft_layers = getattr(draft_hf_config, "num_hidden_layers",
+                                   num_target_layers)
+        num_selected = getattr(draft_hf_config, "num_target_layers",
+                               num_draft_layers)
+        if num_selected == 1:
+            return (num_target_layers // 2,)
+        start = 1
+        end = num_target_layers - 3
+        span = end - start
+        return tuple(
+            int(round(start + (i * span) / (num_selected - 1)))
+            for i in range(num_selected)
+        )
 
     def __call__(
         self,
@@ -313,10 +313,12 @@ class Qwen3Model(Qwen2Model):
             x = inputs_embeds
         else:
             x = self.embed_tokens(input_ids)
+
         aux_hidden_states = []
         for i, layer in enumerate(
                 islice(self.layers, self.start_layer, self.end_layer)):
-            layer_idx = self.start_layer + i
+            if i in self.aux_hidden_state_layers:
+                aux_hidden_states.append(x)
             kv_cache = kv_caches[i]
             kv_cache, x = layer(
                 kv_cache,
@@ -324,8 +326,6 @@ class Qwen3Model(Qwen2Model):
                 attention_metadata,
             )
             kv_caches[i] = kv_cache
-            if layer_idx in self.aux_hidden_state_layers:
-                aux_hidden_states.append(x)
         x = self.norm(x)
         return kv_caches, x, aux_hidden_states
 
@@ -334,6 +334,17 @@ class Qwen3ForCausalLM(JaxModule, LoadableWithIterator):
 
     def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array,
                  mesh: Mesh) -> None:
+        if getattr(vllm_config.model_config, "quantization", None) == "fp8":
+            # `get_tpu_quantization_config` returns None for "fp8" because
+            # the work in #1623 is not fully merged. So this block overrides
+            # the logic to return Fp8Config when model_config indicates fp8.
+            # TODO(#1623): Remove this block when `get_tpu_quantization_config`
+            # is updated.
+            from tpu_inference.layers.jax.quantization.fp8 import Fp8Config
+            hg_quant_config = getattr(vllm_config.model_config.hf_config,
+                                      "quantization_config", {})
+            vllm_config.quant_config = Fp8Config(hg_quant_config)
+
         self.vllm_config = vllm_config
         rng = nnx.Rngs(rng_key)
         self.mesh = mesh

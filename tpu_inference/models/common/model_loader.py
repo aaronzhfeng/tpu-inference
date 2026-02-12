@@ -59,6 +59,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     # would cause JAX init failure when using multi hosts with Ray.
 
     from tpu_inference.models.jax.deepseek_v3 import DeepSeekV3
+    from tpu_inference.models.jax.dflash import DFlashForCausalLM
     from tpu_inference.models.jax.gpt_oss import GptOss
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
@@ -67,8 +68,8 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.qwen2 import Qwen2ForCausalLM
     from tpu_inference.models.jax.qwen2_5_vl import \
         Qwen2_5_VLForConditionalGeneration
-    from tpu_inference.models.jax.qwen3_dflash import Qwen3DFlashForCausalLM
     from tpu_inference.models.jax.qwen3 import Qwen3ForCausalLM
+    _MODEL_REGISTRY["DFlashDraftModel"] = DFlashForCausalLM
     _MODEL_REGISTRY["Llama4ForCausalLM"] = Llama4ForCausalLM
     _MODEL_REGISTRY["DeepseekV3ForCausalLM"] = DeepSeekV3
     _MODEL_REGISTRY["LlamaForCausalLM"] = LlamaForCausalLM
@@ -79,8 +80,6 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["Eagle3LlamaForCausalLM"] = EagleLlama3ForCausalLM
     _MODEL_REGISTRY["GptOssForCausalLM"] = GptOss
     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM
-    _MODEL_REGISTRY["DFlashDraftModel"] = Qwen3DFlashForCausalLM
-    _MODEL_REGISTRY["Qwen3DFlashForCausalLM"] = Qwen3DFlashForCausalLM
 
     architectures = getattr(config, "architectures", [])
     for arch in architectures:
