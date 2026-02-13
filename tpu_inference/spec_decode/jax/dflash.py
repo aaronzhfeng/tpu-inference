@@ -92,6 +92,13 @@ class DFlashProposer:
         self._cache_len: int = 0
         self._max_kv_len: int = 0
 
+        # Track previous seq_len for GPU-compatible crop semantics.
+        # GPU calls past_key_values_draft.crop(start) AFTER each forward
+        # pass, where start = beginning of the CURRENT iteration's block.
+        # This equals the seq_len from the PREVIOUS call to prepare_inputs.
+        # We must match this: cache_len = prev_seq_len, not current seq_len.
+        self._prev_seq_len: int = 0
+
     # ------------------------------------------------------------------
     # Model loading
     # ------------------------------------------------------------------
@@ -210,6 +217,23 @@ class DFlashProposer:
             p *= 2
         return p
 
+    @staticmethod
+    def _pad_context(ctx: np.ndarray) -> np.ndarray:
+        """Pad context array to the next power-of-2 size (min 16).
+
+        Args:
+            ctx: (T, D) numpy array of context features.
+
+        Returns:
+            (T_padded, D) numpy array with zero-padding appended.
+        """
+        T = ctx.shape[0]
+        T_padded = DFlashProposer._next_padded_size(T)
+        if T_padded == T:
+            return ctx
+        pad = np.zeros((T_padded - T, ctx.shape[1]), dtype=ctx.dtype)
+        return np.concatenate([ctx, pad], axis=0)
+
     # ------------------------------------------------------------------
     # Input preparation
     # ------------------------------------------------------------------
@@ -247,16 +271,27 @@ class DFlashProposer:
         seq_len_jax = attn_metadata.seq_lens[0]
         seq_len = int(jax.device_get(seq_len_jax))
 
-        # 2. Sync cache_len with actual accepted seq_len.
-        # On the first call, _cache_len is 0 and we need to fill from scratch.
-        # On subsequent calls, the previous iteration wrote ctx + noise into
-        # the cache, but only some noise tokens were accepted. Reset
-        # cache_len to seq_len so the next write overwrites rejected noise.
-        # But ONLY if we've already populated the cache (i.e., _ctx_len > 0).
-        if self._ctx_len > 0:
-            self._cache_len = seq_len
+        # 2. Crop cache to match GPU DynamicCache.crop(start) semantics.
+        #
+        # GPU reference (zhongyan_dev/dflash/model/dflash.py line 246):
+        #   past_key_values_draft.crop(start)
+        # where `start` = beginning of the CURRENT block = position of
+        # the first accepted token from the previous iteration.
+        #
+        # After crop, GPU cache_seq_len = start, which equals the seq_len
+        # from the PREVIOUS prepare_inputs call (not the current one).
+        # Context + noise are then written starting from this position.
+        #
+        # Bug was: self._cache_len = seq_len (CURRENT accepted position),
+        # which left stale noise K/V entries from the previous iteration
+        # in positions [prev_seq_len, seq_len) and shifted all subsequent
+        # RoPE positions, accumulating errors every iteration.
+        if self._prev_seq_len > 0:
+            self._cache_len = self._prev_seq_len
+
         if seq_len < self._ctx_len:
             self._ctx_len = seq_len
+        self._prev_seq_len = seq_len
 
         # 3. Project new auxiliary hidden states
         projected = self._project_aux_hidden(aux_hidden_states)
@@ -265,18 +300,19 @@ class DFlashProposer:
         new_ctx_np = self._update_context_buffer(projected, seq_len)
 
         if new_ctx_np is None or len(new_ctx_np) == 0:
-            # Full rejection - use a single zero token as placeholder.
-            # actual_new_ctx_count=0 tells the model to skip it.
+            # Full rejection — all padded entries are zeros, and noise
+            # writes at cache_len + 0, completely overwriting them.
             actual_new_ctx_count = 0
             new_ctx_np = np.zeros(
-                (1, self.hidden_size), dtype=np.float32
+                (16, self.hidden_size), dtype=np.float32
             )
         else:
             actual_new_ctx_count = len(new_ctx_np)
+            new_ctx_np = self._pad_context(new_ctx_np)
 
-        # 5. Upload new context tokens to device (NO padding).
-        # JIT will retrace for different context sizes, but after prefill
-        # the context delta is typically 1-16 tokens which stabilises.
+        # 5. Upload padded context to device.
+        # Padding to power-of-2 sizes (16/32/64/128) means JIT only
+        # traces ~4 unique shapes, eliminating per-token retracing.
         new_ctx_jax = device_array(
             self.mesh,
             jnp.array(new_ctx_np, dtype=jnp.bfloat16),
@@ -293,11 +329,14 @@ class DFlashProposer:
             self.block_size,
         )
 
-        # 7. Pack target_hidden_states as tuple (always same pytree shape)
+        # 7. Pack target_hidden_states as 3-tuple (always same pytree shape)
         cache_len_arr = device_array(
             self.mesh, np.array([self._cache_len], dtype=np.int32)
         )
-        target_hidden = (new_ctx_jax, cache_len_arr)
+        actual_ctx_count_arr = device_array(
+            self.mesh, np.array([actual_new_ctx_count], dtype=np.int32)
+        )
+        target_hidden = (new_ctx_jax, cache_len_arr, actual_ctx_count_arr)
 
         # 8. Build draft attention metadata
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
@@ -364,14 +403,14 @@ class DFlashProposer:
         # Update cached references
         self._draft_kv_caches = draft_kv_caches
 
-        # Update cache_len: model wrote T_ctx + T_noise entries.
+        # Update cache_len: model wrote actual_ctx_count + T_noise entries.
         # This will be corrected at the start of the next prepare_inputs
         # to match the actual accepted seq_len.
-        ctx_hidden, cache_len_arr = target_hidden_states
+        _, cache_len_arr, actual_ctx_count_arr = target_hidden_states
         old_cache_len = int(jax.device_get(cache_len_arr)[0])
-        T_ctx = ctx_hidden.shape[0]
+        actual_ctx_count = int(jax.device_get(actual_ctx_count_arr)[0])
         T_noise = self.block_size
-        self._cache_len = old_cache_len + T_ctx + T_noise
+        self._cache_len = old_cache_len + actual_ctx_count + T_noise
 
         draft_token_ids = self._sample_block_draft_tokens(
             self.state, hidden_states
