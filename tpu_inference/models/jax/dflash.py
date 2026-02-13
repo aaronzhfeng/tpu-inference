@@ -3,9 +3,14 @@
 This module implements the DFlash block-diffusion draft model for speculative
 decoding on TPU, compatible with the vLLM/tpu-inference framework.
 
+Phase 3 architecture: uses a **static-shape on-device KV cache** per layer and
+the TPU ``flash_attention`` Pallas kernel (``causal=False``) to match the GPU
+DynamicCache semantics.  See docs/17_gpu_vs_tpu_dflash_gap_analysis.md.
+
 Architecture overview:
-  - DFlashAttention: Cross+self attention where Q comes from noise embeddings,
-    K/V comes from concatenated [context_features, noise_embeddings].
+  - DFlashAttention: Projects Q from noise, projects K/V for new tokens only,
+    appends to a pre-allocated KV cache via dynamic_update_slice, then runs
+    non-causal flash_attention over the full cache.
   - DFlashDecoderLayer: LayerNorm -> Attention -> Residual -> LayerNorm -> MLP -> Residual.
   - DFlashModel: Stack of decoder layers with FC projection, norms, and embedding.
   - DFlashForCausalLM: Top-level model with __call__, compute_logits,
@@ -17,11 +22,17 @@ from typing import List, Optional, Tuple
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax import lax
 from jax.sharding import Mesh
 from transformers import Qwen3Config
 from vllm.config import VllmConfig
 
 from tpu_inference import utils
+from tpu_inference.kernels.flash_attention.kernel import (
+    BlockSizes,
+    SegmentIds,
+    flash_attention,
+)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax.rope_interface import apply_rope
 from tpu_inference.logger import init_logger
@@ -37,17 +48,24 @@ logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
 
+# vmem budget for the flash_attention Pallas kernel (128 MiB).
+_FA_VMEM_LIMIT = 128 * 1024 * 1024
+
 
 # ---------------------------------------------------------------------------
-# DFlash Attention
+# DFlash Attention (Phase 3: on-device KV cache + flash_attention kernel)
 # ---------------------------------------------------------------------------
 
 class DFlashAttention(nnx.Module):
-    """DFlash cross+self attention.
+    """DFlash cross+self attention with on-device KV cache.
 
-    Q is projected from noise embeddings only.
-    K/V are projected from the concatenation of [context_features, noise_embeddings]
-    along the sequence dimension.  Attention is **non-causal** (full mask).
+    Each call:
+      1. Projects Q from noise embeddings, K/V from [context, noise].
+      2. Applies RoPE to Q and K.
+      3. Expands K/V for GQA.
+      4. Writes NEW K/V into the pre-allocated cache via dynamic_update_slice.
+      5. Runs non-causal flash_attention over the full cache up to the valid
+         length, using segment_ids to mask padding.
     """
 
     def __init__(
@@ -136,67 +154,102 @@ class DFlashAttention(nnx.Module):
         target_hidden: jax.Array,
         noise_positions: jax.Array,
         ctx_positions: jax.Array,
-        actual_ctx_len: jax.Array,
-    ) -> jax.Array:
-        """
+        kv_cache_k: jax.Array,
+        kv_cache_v: jax.Array,
+        cache_len: jax.Array,
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """Non-causal attention with on-device KV cache.
+
         Args:
             x_noise: (T_noise, D) noise hidden states.
-            target_hidden: (T_ctx_padded, D) projected context features
-                           (may be zero-padded beyond actual_ctx_len).
+            target_hidden: (T_ctx, D) projected context features (all real).
             noise_positions: (T_noise,) position ids for noise tokens.
-            ctx_positions: (T_ctx_padded,) position ids for context tokens.
-            actual_ctx_len: scalar – number of real (non-padding) context
-                            tokens.  Positions beyond this are masked in
-                            the softmax.
+            ctx_positions: (T_ctx,) position ids for context tokens.
+            kv_cache_k: (1, N_heads, max_kv_len, H) pre-allocated K cache.
+            kv_cache_v: (1, N_heads, max_kv_len, H) pre-allocated V cache.
+            cache_len: scalar int, valid entries already in cache.
 
         Returns:
-            output: (T_noise, D) attention output.
+            (output, new_kv_cache_k, new_kv_cache_v)
         """
-        # Q from noise only
-        q = self.q_proj(x_noise)       # (T_noise, N, H)
+        T_noise = x_noise.shape[0]
+        T_ctx_padded = target_hidden.shape[0]
+
+        # 1. Project Q (noise only)
+        q = self.q_proj(x_noise)
         q = self.q_norm(q)
-
-        # K/V from context + noise
-        x_all = jnp.concatenate([target_hidden, x_noise], axis=0)  # (S, D)
-        k = self.k_proj(x_all)         # (S, K, H)
-        v = self.v_proj(x_all)         # (S, K, H)
-        k = self.k_norm(k)
-
-        # RoPE
-        all_positions = jnp.concatenate([ctx_positions, noise_positions], axis=0)
         q = apply_rope(
             q, noise_positions, self.head_dim_original,
             self.rope_theta, self.rope_scaling,
         )
-        k = apply_rope(
-            k, all_positions, self.head_dim_original,
+
+        # 2. Project K/V for NEW tokens [ctx_padded, noise]
+        x_new = jnp.concatenate([target_hidden, x_noise], axis=0)
+        k_new = self.k_proj(x_new)
+        v_new = self.v_proj(x_new)
+        k_new = self.k_norm(k_new)
+
+        new_positions = jnp.concatenate([ctx_positions, noise_positions], axis=0)
+        k_new = apply_rope(
+            k_new, new_positions, self.head_dim_original,
             self.rope_theta, self.rope_scaling,
         )
 
-        # GQA: expand K/V heads to match Q heads
         if self.num_kv_groups > 1:
-            k = jnp.repeat(k, self.num_kv_groups, axis=1)  # (S, N, H)
-            v = jnp.repeat(v, self.num_kv_groups, axis=1)  # (S, N, H)
+            k_new = jnp.repeat(k_new, self.num_kv_groups, axis=1)
+            v_new = jnp.repeat(v_new, self.num_kv_groups, axis=1)
 
-        # Attention scores
-        ctx_padded = target_hidden.shape[0]
-        total_kv = ctx_padded + x_noise.shape[0]
-        scale = 1.0 / jnp.sqrt(jnp.float32(self.head_dim_original))
-        attn_weights = jnp.einsum("tnh,snh->nts", q, k) * scale
+        # 3. Write ALL new K/V into cache contiguously.
+        # Since context is NOT padded, T_ctx = actual_new_ctx (all real).
+        # Everything written is valid. cache_len = true valid count.
+        T_new = T_ctx_padded + T_noise  # T_ctx_padded = actual ctx (no padding)
+        k_new_4d = k_new.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
+        v_new_4d = v_new.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
 
-        # Mask out padding context positions so they don't steal
-        # softmax probability from real tokens.
-        # Real positions: [0..actual_ctx_len-1] and [ctx_padded..total_kv-1]
-        kv_idx = jnp.arange(total_kv)
-        kv_valid = (kv_idx < actual_ctx_len) | (kv_idx >= ctx_padded)
-        # Shape: (1, 1, total_kv) → broadcast over (N, T_noise, total_kv)
-        mask = kv_valid[jnp.newaxis, jnp.newaxis, :]
-        attn_weights = jnp.where(mask, attn_weights, jnp.finfo(q.dtype).min)
+        kv_cache_k = lax.dynamic_update_slice(
+            kv_cache_k, k_new_4d, (0, 0, cache_len, 0)
+        )
+        kv_cache_v = lax.dynamic_update_slice(
+            kv_cache_v, v_new_4d, (0, 0, cache_len, 0)
+        )
 
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-        attn_output = jnp.einsum("nts,snh->tnh", attn_weights, v)
+        new_cache_len = cache_len + T_new
+        max_kv_len = kv_cache_k.shape[2]
 
-        return self.o_proj(attn_output)   # (T_noise, D)
+        # 4. Flash attention (non-causal) with segment_ids mask
+        q_4d = q.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
+
+        # Simple validity: all slots 0..new_cache_len-1 are valid.
+        kv_ids = (jnp.arange(max_kv_len) < new_cache_len).astype(jnp.int32)
+        q_ids = jnp.ones(T_noise, dtype=jnp.int32)
+        seg_ids = SegmentIds(
+            q=q_ids[jnp.newaxis, :],
+            kv=kv_ids[jnp.newaxis, :],
+        )
+
+        sm_scale = self.head_dim_original ** -0.5
+        # Block sizes: block_q must be <= q_seq_len (T_noise).
+        # Use single-step K processing (block_k = block_k_major = max_kv_len)
+        # since the kernel optimises this path.
+        block_sizes = BlockSizes(
+            block_q=T_noise,
+            block_k_major=max_kv_len,
+            block_k=max_kv_len,
+            block_b=1,
+        )
+        attn_out = flash_attention(
+            q_4d, kv_cache_k, kv_cache_v,
+            segment_ids=seg_ids,
+            causal=False,
+            sm_scale=sm_scale,
+            block_sizes=block_sizes,
+            vmem_limit_bytes=_FA_VMEM_LIMIT,
+        )
+
+        attn_out = attn_out[0].transpose(1, 0, 2)
+        output = self.o_proj(attn_out)
+
+        return output, kv_cache_k, kv_cache_v
 
 
 # ---------------------------------------------------------------------------
@@ -269,19 +322,24 @@ class DFlashDecoderLayer(nnx.Module):
         target_hidden: jax.Array,
         noise_positions: jax.Array,
         ctx_positions: jax.Array,
-        actual_ctx_len: jax.Array,
-    ) -> jax.Array:
+        kv_cache_k: jax.Array,
+        kv_cache_v: jax.Array,
+        cache_len: jax.Array,
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """Returns (hidden_states, new_kv_cache_k, new_kv_cache_v)."""
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(
-            x, target_hidden, noise_positions, ctx_positions, actual_ctx_len)
+        x, kv_cache_k, kv_cache_v = self.self_attn(
+            x, target_hidden, noise_positions, ctx_positions,
+            kv_cache_k, kv_cache_v, cache_len,
+        )
         x = residual + x
 
         residual = x
         x = self.post_attention_layernorm(x)
         x = self.mlp(x)
         x = residual + x
-        return x
+        return x, kv_cache_k, kv_cache_v
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +454,9 @@ class DFlashWeightLoader(BaseWeightLoader):
 class DFlashForCausalLM(nnx.Module):
     """DFlash draft model for speculative decoding on TPU.
 
+    Phase 3: uses per-layer on-device KV caches passed through the
+    ``kv_caches`` list and the TPU flash_attention kernel with causal=False.
+
     Compatible with the vLLM / tpu-inference model registry interface.
     """
 
@@ -435,43 +496,59 @@ class DFlashForCausalLM(nnx.Module):
     ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array]]:
         """Forward pass for the DFlash draft model.
 
-        Args:
-            kv_caches: KV cache arrays (passed through unchanged).
-            input_ids: (T_noise,) token IDs for the draft block.
-            target_hidden_states: (T_ctx, D) already-projected context features
-                (output of combine_hidden_states).
-            attention_metadata: AttentionMetadata with input_positions, etc.
+        ``target_hidden_states`` is a tuple:
+            (ctx_hidden, cache_len_arr)
+        where:
+            ctx_hidden: (T_ctx, D) — new context tokens (all real).
+            cache_len_arr: (1,) int32 — valid entries already in KV cache.
+
+        ``kv_caches`` is a flat list of length ``2 * num_layers``:
+            [k_cache_0, v_cache_0, k_cache_1, v_cache_1, ...]
+        Each cache has shape ``(1, num_heads, max_kv_len, head_dim)``.
 
         Returns:
-            Tuple of (kv_caches, hidden_states, [target_hidden_states]).
+            (kv_caches, hidden_states, [target_hidden_states])
         """
+        # Unpack target_hidden_states:
+        #   ctx_hidden: (T_ctx, D) — new context tokens (all real, no padding).
+        #   cache_len_arr: (1,) int32 — valid entries already in KV cache.
+        ctx_hidden, cache_len_arr = target_hidden_states
+        cache_len = cache_len_arr[0]  # scalar
+
         # Embed the draft block tokens
         noise_emb = self.model.embed_tokens(input_ids)   # (T_noise, D)
 
-        # Derive positions
-        noise_positions = attention_metadata.input_positions  # (T_noise,)
-        ctx_padded = target_hidden_states.shape[0]
-        first_noise_pos = noise_positions[0]
-        ctx_positions = jnp.arange(ctx_padded) + jnp.maximum(
-            first_noise_pos - ctx_padded, 0
-        )
-
-        # actual_ctx_len = first_noise_pos (noise starts right after context)
-        actual_ctx_len = first_noise_pos
+        # Derive positions for NEW context + noise tokens.
+        # GPU DFlash uses position_ids = [cache_seq_len, ..., cache_seq_len + n_ctx + block_size - 1]
+        # where context gets the first n_ctx positions and noise gets the rest.
+        # cache_len = seq_len (synced by proposer), so:
+        #   ctx positions: [cache_len, cache_len+1, ..., cache_len + T_ctx - 1]
+        #   noise positions: [cache_len + T_ctx, ..., cache_len + T_ctx + block_size - 1]
+        T_ctx = ctx_hidden.shape[0]
+        T_noise = input_ids.shape[0]
+        ctx_positions = jnp.arange(T_ctx, dtype=jnp.int32) + cache_len
+        noise_positions = jnp.arange(T_noise, dtype=jnp.int32) + cache_len + T_ctx
 
         # Run through decoder layers
         x = noise_emb
-        for layer in self.model.layers:
-            x = layer(
-                x, target_hidden_states, noise_positions,
-                ctx_positions, actual_ctx_len,
+        num_layers = len(self.model.layers)
+        for i, layer in enumerate(self.model.layers):
+            kv_k = kv_caches[2 * i]
+            kv_v = kv_caches[2 * i + 1]
+            x, kv_k, kv_v = layer(
+                x, ctx_hidden, noise_positions, ctx_positions,
+                kv_k, kv_v, cache_len,
             )
+            kv_caches[2 * i] = kv_k
+            kv_caches[2 * i + 1] = kv_v
 
         x = self.model.norm(x)
 
-        # Return target_hidden_states as "residual" so that the proposer
-        # can pass them back in subsequent iterations.
-        return kv_caches, x, [target_hidden_states]
+        # Return empty list as 3rd element — the proposer tracks cache_len
+        # externally, and passing the target_hidden_states tuple back causes
+        # JIT sharding errors (1D arrays in the tuple get incompatible
+        # PartitionSpec).
+        return kv_caches, x, []
 
     # ----- logits ---------------------------------------------------------
 

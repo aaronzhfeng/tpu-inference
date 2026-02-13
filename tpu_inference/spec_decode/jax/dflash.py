@@ -13,14 +13,17 @@
 # limitations under the License.
 """DFlash proposer for speculative decoding on JAX/TPU.
 
-DFlash is a block-diffusion draft model that produces an entire block of
-draft tokens in a single forward pass.
+Phase 3: uses per-layer **on-device KV caches** managed by this proposer,
+passed to the DFlash model via the ``kv_caches`` parameter.  The model
+appends new K/V projections via ``dynamic_update_slice`` and attends over
+the full cache with the TPU ``flash_attention`` kernel (``causal=False``).
 
-Key design: the proposer maintains a **context accumulation buffer** that
-grows across speculative-decoding iterations, mimicking the PyTorch
-DynamicCache used in the original DFlash implementation.  On each iteration
-the newly-accepted tokens' projected hidden states are appended to the
-buffer so that the draft model always sees the full sequence history.
+This matches the GPU DynamicCache semantics:
+  - K/V for *all* accepted tokens (context + noise) persist in the cache.
+  - Only NEW tokens get projected each iteration; past K/V are read from cache.
+  - On rejection the proposer just decrements ``cache_len``.
+
+See docs/17_gpu_vs_tpu_dflash_gap_analysis.md for the full gap analysis.
 """
 
 import functools
@@ -44,12 +47,16 @@ logger = init_logger(__name__)
 
 
 class DFlashProposer:
-    """Proposer for speculative decoding using DFlash block diffusion."""
+    """Proposer for speculative decoding using DFlash block diffusion.
+
+    Phase 3: manages on-device per-layer KV caches and a host-side context
+    projection buffer.
+    """
 
     def __init__(
         self,
         vllm_config: VllmConfig,
-        runner: Any,  # TPUModelRunner
+        runner: Any,
     ):
         self.vllm_config = vllm_config
         self.speculative_config = vllm_config.speculative_config
@@ -70,17 +77,20 @@ class DFlashProposer:
         dflash_config = getattr(hf_config, "dflash_config", {})
         self.mask_token_id = dflash_config.get("mask_token_id", 0)
         self.hidden_size = hf_config.hidden_size
+        self.num_layers = hf_config.num_hidden_layers
 
         self.rng_key = jax.random.key(self.vllm_config.model_config.seed)
         self.max_num_tokens = runner.max_num_tokens
         self.max_model_len = runner.max_model_len
 
-        # ── Context accumulation buffer ──────────────────────────────
-        # Stores projected target hidden states (after fc + hidden_norm)
-        # across iterations so the draft model sees the full history.
-        # Shape: (max_model_len, hidden_size) – host-side NumPy array.
+        # Host-side context projection buffer
         self._ctx_buf: Optional[np.ndarray] = None
-        self._ctx_len: int = 0  # valid entries in the buffer
+        self._ctx_len: int = 0
+
+        # On-device KV caches (allocated in load_model)
+        self._draft_kv_caches: Optional[list[jax.Array]] = None
+        self._cache_len: int = 0
+        self._max_kv_len: int = 0
 
     # ------------------------------------------------------------------
     # Model loading
@@ -119,14 +129,44 @@ class DFlashProposer:
                 )
                 self.state.model.embed_tokens = target_embed
 
+        # Allocate on-device KV caches
+        hf_config = self.draft_model_config.hf_config
+        from tpu_inference import utils
+        from tpu_inference.layers.common.sharding import ShardingAxisName
+        from tpu_inference.utils import get_mesh_shape_product
+
+        sharding_size = get_mesh_shape_product(
+            self.mesh, ShardingAxisName.MLP_TENSOR)
+        num_heads = utils.get_padded_num_heads(
+            hf_config.num_attention_heads, sharding_size)
+        head_dim_orig = getattr(
+            hf_config, "head_dim",
+            hf_config.hidden_size // hf_config.num_attention_heads)
+        head_dim = utils.get_padded_head_dim(head_dim_orig)
+
+        self._max_kv_len = self._next_padded_size(self.max_model_len)
+        cache_shape = (1, num_heads, self._max_kv_len, head_dim)
+        self._draft_kv_caches = []
+        for _ in range(self.num_layers):
+            k_cache = jnp.zeros(cache_shape, dtype=jnp.bfloat16)
+            v_cache = jnp.zeros(cache_shape, dtype=jnp.bfloat16)
+            self._draft_kv_caches.append(k_cache)
+            self._draft_kv_caches.append(v_cache)
+        self._cache_len = 0
+
+        logger.info(
+            "Allocated DFlash on-device KV caches: %d layers, shape %s",
+            self.num_layers, cache_shape,
+        )
+
     # ------------------------------------------------------------------
-    # Context buffer management (host-side, outside JIT)
+    # Context buffer management (host-side)
     # ------------------------------------------------------------------
 
     def _project_aux_hidden(
         self, aux_hidden_states: tuple[jax.Array, ...]
     ) -> jax.Array:
-        """Project & normalise auxiliary hidden states (JIT-compiled)."""
+        """Project and normalise auxiliary hidden states."""
         raw = jnp.concatenate(aux_hidden_states, axis=-1)
         return self.combine_hidden_states_fn(self.state, raw)
 
@@ -134,20 +174,14 @@ class DFlashProposer:
         self,
         projected: jax.Array,
         seq_len: int,
-    ) -> None:
+    ) -> Optional[np.ndarray]:
         """Append newly-accepted projected hidden states to the buffer.
 
-        Args:
-            projected: (padded_T, D) freshly projected context from the
-                       latest target forward.  Only the first ``num_new``
-                       entries are real (rest is padding).
-            seq_len:   Current total sequence length after this target
-                       forward (= number of valid context tokens so far).
+        Returns the NEW context tokens as a numpy array, or None on rejection.
         """
         proj_np = np.asarray(projected)
 
         if self._ctx_buf is None:
-            # First call: allocate the fixed-size buffer.
             self._ctx_buf = np.zeros(
                 (self.max_model_len, proj_np.shape[-1]),
                 dtype=proj_np.dtype,
@@ -155,41 +189,26 @@ class DFlashProposer:
 
         num_new = seq_len - self._ctx_len
         if num_new <= 0:
-            # Possible after full rejection – nothing to append.
-            # Just crop to seq_len (discard tokens beyond accepted prefix).
             self._ctx_len = seq_len
-            return
+            self._cache_len = min(self._cache_len, seq_len)
+            return None
 
-        # Copy the first `num_new` real entries from the projection into
-        # the buffer right after the existing context.
         end = min(self._ctx_len + num_new, self.max_model_len)
         n_copy = end - self._ctx_len
         self._ctx_buf[self._ctx_len : end] = proj_np[:n_copy]
+        new_ctx = proj_np[:n_copy].copy()
         self._ctx_len = end
+        return new_ctx
 
     @staticmethod
     def _next_padded_size(n: int) -> int:
-        """Round *n* up to the next power-of-two (min 16)."""
+        """Round n up to the next power-of-two (min 16)."""
         if n <= 16:
             return 16
         p = 16
         while p < n:
             p *= 2
         return p
-
-    def _get_context_jax(self) -> jax.Array:
-        """Return accumulated context padded to a power-of-two length.
-
-        Padding to a fixed set of sizes (16, 32, 64, …) means the JIT-
-        compiled model function only needs to be traced once per bucket,
-        eliminating the costly retrace-per-token that made the previous
-        version slow.
-        """
-        padded = self._next_padded_size(self._ctx_len)
-        padded = min(padded, self.max_model_len)
-        # Slice the pre-allocated buffer and return exactly `padded` rows.
-        # Rows beyond _ctx_len are already zero.
-        return device_array(self.mesh, self._ctx_buf[:padded])
 
     # ------------------------------------------------------------------
     # Input preparation
@@ -203,14 +222,7 @@ class DFlashProposer:
         mask_token_id: int,
         block_size: int,
     ) -> tuple[jax.Array, jax.Array]:
-        """Build noise block and positions (JIT-compiled).
-
-        Args:
-            seq_len_arr: (1,) array containing the current sequence length.
-        Returns:
-            noise_input_ids: (block_size,) [next_token, mask, …].
-            noise_positions: (block_size,) [seq_len, seq_len+1, …].
-        """
+        """Build noise block and positions (JIT-compiled)."""
         seq_len = seq_len_arr[0]
         first_token = next_token_ids[0]
         noise_input_ids = jnp.full(
@@ -228,27 +240,49 @@ class DFlashProposer:
         next_token_ids: jax.Array,
         num_rejected_tokens: Optional[jax.Array] = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, AttentionMetadata]:
-        """Prepare DFlash inputs with accumulated context.
-
-        Returns:
-            target_hidden  – (ctx_len, D) accumulated projected context.
-            noise_ids      – (block_size,) noise block token IDs.
-            dummy_indices  – unused, kept for API compat.
-            draft_metadata – attention metadata with noise positions.
-        """
+        """Prepare DFlash inputs with on-device KV cache."""
         assert aux_hidden_states is not None and len(aux_hidden_states) > 0
 
-        # 1. Determine current sequence length.
+        # 1. Current sequence length
         seq_len_jax = attn_metadata.seq_lens[0]
         seq_len = int(jax.device_get(seq_len_jax))
 
-        # 2. Project the new auxiliary hidden states.
+        # 2. Sync cache_len with actual accepted seq_len.
+        # On the first call, _cache_len is 0 and we need to fill from scratch.
+        # On subsequent calls, the previous iteration wrote ctx + noise into
+        # the cache, but only some noise tokens were accepted. Reset
+        # cache_len to seq_len so the next write overwrites rejected noise.
+        # But ONLY if we've already populated the cache (i.e., _ctx_len > 0).
+        if self._ctx_len > 0:
+            self._cache_len = seq_len
+        if seq_len < self._ctx_len:
+            self._ctx_len = seq_len
+
+        # 3. Project new auxiliary hidden states
         projected = self._project_aux_hidden(aux_hidden_states)
 
-        # 3. Update the accumulation buffer.
-        self._update_context_buffer(projected, seq_len)
+        # 4. Update context buffer and get NEW tokens
+        new_ctx_np = self._update_context_buffer(projected, seq_len)
 
-        # 4. Build noise block & positions.
+        if new_ctx_np is None or len(new_ctx_np) == 0:
+            # Full rejection - use a single zero token as placeholder.
+            # actual_new_ctx_count=0 tells the model to skip it.
+            actual_new_ctx_count = 0
+            new_ctx_np = np.zeros(
+                (1, self.hidden_size), dtype=np.float32
+            )
+        else:
+            actual_new_ctx_count = len(new_ctx_np)
+
+        # 5. Upload new context tokens to device (NO padding).
+        # JIT will retrace for different context sizes, but after prefill
+        # the context delta is typically 1-16 tokens which stabilises.
+        new_ctx_jax = device_array(
+            self.mesh,
+            jnp.array(new_ctx_np, dtype=jnp.bfloat16),
+        )
+
+        # 6. Build noise block
         seq_len_arr = device_array(
             self.mesh, np.array([seq_len], dtype=np.int32)
         )
@@ -259,10 +293,13 @@ class DFlashProposer:
             self.block_size,
         )
 
-        # 5. Convert accumulated context to JAX array.
-        target_hidden = self._get_context_jax()
+        # 7. Pack target_hidden_states as tuple (always same pytree shape)
+        cache_len_arr = device_array(
+            self.mesh, np.array([self._cache_len], dtype=np.int32)
+        )
+        target_hidden = (new_ctx_jax, cache_len_arr)
 
-        # 6. Build draft attention metadata.
+        # 8. Build draft attention metadata
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
         block_tables = (
@@ -298,13 +335,7 @@ class DFlashProposer:
         state: nnx.State,
         hidden_states: jax.Array,
     ) -> jax.Array:
-        """Greedy-sample draft tokens from the block output.
-
-        Args:
-            hidden_states: (block_size, D) full block output.
-        Returns:
-            (num_speculative_tokens,) draft token IDs.
-        """
+        """Greedy-sample draft tokens from the block output."""
         draft_hidden = hidden_states[1 : 1 + self.num_speculative_tokens]
         logits = self.compute_logits_fn(state, draft_hidden, None)
         draft_ids = jnp.argmax(logits, axis=-1)
@@ -318,16 +349,29 @@ class DFlashProposer:
         input_ids: jax.Array,
         attn_metadata: AttentionMetadata,
         last_token_indices: jax.Array,
-        target_hidden_states: jax.Array,
+        target_hidden_states,
     ) -> tuple[list[jax.Array], jnp.ndarray]:
         """Generate all draft tokens in one forward pass."""
-        kv_caches, hidden_states, _aux = self.model_fn(
+        # Use our own on-device KV caches
+        draft_kv_caches, hidden_states, _ = self.model_fn(
             self.state,
-            kv_caches,
+            self._draft_kv_caches,
             input_ids,
             target_hidden_states,
             attn_metadata,
         )
+
+        # Update cached references
+        self._draft_kv_caches = draft_kv_caches
+
+        # Update cache_len: model wrote T_ctx + T_noise entries.
+        # This will be corrected at the start of the next prepare_inputs
+        # to match the actual accepted seq_len.
+        ctx_hidden, cache_len_arr = target_hidden_states
+        old_cache_len = int(jax.device_get(cache_len_arr)[0])
+        T_ctx = ctx_hidden.shape[0]
+        T_noise = self.block_size
+        self._cache_len = old_cache_len + T_ctx + T_noise
 
         draft_token_ids = self._sample_block_draft_tokens(
             self.state, hidden_states
@@ -336,4 +380,5 @@ class DFlashProposer:
         if draft_token_ids.ndim == 1:
             draft_token_ids = draft_token_ids[jnp.newaxis, :]
 
+        # Pass the FRAMEWORK kv_caches through unchanged
         return kv_caches, draft_token_ids
