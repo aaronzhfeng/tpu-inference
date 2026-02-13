@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
 import jax.numpy as jnp
@@ -23,9 +23,12 @@ from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
+from tpu_inference.logger import init_logger
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 from tpu_inference.utils import device_array
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from tpu_inference.layers.common.attention_metadata import \
@@ -155,8 +158,23 @@ class SpeculativeDecodingManager:
                 self.runner.mesh, np.array(num_rejected_tokens,
                                            dtype=jnp.int32))
 
-        target_hidden_states, input_ids, last_token_indices, attn_metadata = self.runner.drafter.prepare_inputs(
+        # Use the actual accepted seq_len (num_tokens_no_spec) instead of
+        # attn_metadata.seq_lens which includes unverified draft tokens.
+        # The attn_metadata.seq_lens = num_computed + num_scheduled, where
+        # num_scheduled includes all draft tokens being verified. But the
+        # proposer needs the ACCEPTED count to correctly track its context
+        # buffer and KV cache positions.
+        accepted_seq_lens = self.runner.input_batch.num_tokens_no_spec[
+            :attn_metadata.seq_lens.shape[0]].copy()
+        accepted_attn_metadata = replace(
             attn_metadata,
+            seq_lens=device_array(
+                self.runner.mesh,
+                accepted_seq_lens.astype(np.int32)),
+        )
+
+        target_hidden_states, input_ids, last_token_indices, attn_metadata = self.runner.drafter.prepare_inputs(
+            accepted_attn_metadata,
             input_ids,
             aux_hidden_states,
             next_token_ids,

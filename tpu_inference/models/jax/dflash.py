@@ -157,23 +157,30 @@ class DFlashAttention(nnx.Module):
         kv_cache_k: jax.Array,
         kv_cache_v: jax.Array,
         cache_len: jax.Array,
+        actual_ctx_count: jax.Array,
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """Non-causal attention with on-device KV cache.
 
+        Uses a two-phase cache write to handle padded context correctly:
+          Phase A: write context K/V (with padding zeroed) at ``cache_len``.
+          Phase B: write noise K/V at ``cache_len + actual_ctx_count``,
+                   overwriting any padding zeros from Phase A.
+
         Args:
             x_noise: (T_noise, D) noise hidden states.
-            target_hidden: (T_ctx, D) projected context features (all real).
+            target_hidden: (T_padded, D) padded context features.
             noise_positions: (T_noise,) position ids for noise tokens.
-            ctx_positions: (T_ctx,) position ids for context tokens.
+            ctx_positions: (T_padded,) position ids for context tokens.
             kv_cache_k: (1, N_heads, max_kv_len, H) pre-allocated K cache.
             kv_cache_v: (1, N_heads, max_kv_len, H) pre-allocated V cache.
             cache_len: scalar int, valid entries already in cache.
+            actual_ctx_count: scalar int, real (non-padding) context tokens.
 
         Returns:
             (output, new_kv_cache_k, new_kv_cache_v)
         """
         T_noise = x_noise.shape[0]
-        T_ctx_padded = target_hidden.shape[0]
+        T_padded = target_hidden.shape[0]
 
         # 1. Project Q (noise only)
         q = self.q_proj(x_noise)
@@ -199,24 +206,45 @@ class DFlashAttention(nnx.Module):
             k_new = jnp.repeat(k_new, self.num_kv_groups, axis=1)
             v_new = jnp.repeat(v_new, self.num_kv_groups, axis=1)
 
-        # 3. Write ALL new K/V into cache contiguously.
-        # Since context is NOT padded, T_ctx = actual_new_ctx (all real).
-        # Everything written is valid. cache_len = true valid count.
-        T_new = T_ctx_padded + T_noise  # T_ctx_padded = actual ctx (no padding)
-        k_new_4d = k_new.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
-        v_new_4d = v_new.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
+        # 3. Split into context and noise portions.
+        k_ctx = k_new[:T_padded]
+        v_ctx = v_new[:T_padded]
+        k_noise = k_new[T_padded:]
+        v_noise = v_new[T_padded:]
 
+        # Zero out padding entries in context K/V.
+        ctx_mask = (jnp.arange(T_padded) < actual_ctx_count)  # (T_padded,)
+        ctx_mask_kv = ctx_mask[:, jnp.newaxis, jnp.newaxis]   # (T_padded, 1, 1)
+        k_ctx = jnp.where(ctx_mask_kv, k_ctx, 0.0)
+        v_ctx = jnp.where(ctx_mask_kv, v_ctx, 0.0)
+
+        # 4. Two-phase cache write.
+        # Phase A: write padded context (with zeros) at cache_len.
+        k_ctx_4d = k_ctx.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
+        v_ctx_4d = v_ctx.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
         kv_cache_k = lax.dynamic_update_slice(
-            kv_cache_k, k_new_4d, (0, 0, cache_len, 0)
+            kv_cache_k, k_ctx_4d, (0, 0, cache_len, 0)
         )
         kv_cache_v = lax.dynamic_update_slice(
-            kv_cache_v, v_new_4d, (0, 0, cache_len, 0)
+            kv_cache_v, v_ctx_4d, (0, 0, cache_len, 0)
         )
 
-        new_cache_len = cache_len + T_new
+        # Phase B: write noise at cache_len + actual_ctx_count,
+        # overwriting padding zeros from Phase A.
+        noise_start = cache_len + actual_ctx_count
+        k_noise_4d = k_noise.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
+        v_noise_4d = v_noise.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
+        kv_cache_k = lax.dynamic_update_slice(
+            kv_cache_k, k_noise_4d, (0, 0, noise_start, 0)
+        )
+        kv_cache_v = lax.dynamic_update_slice(
+            kv_cache_v, v_noise_4d, (0, 0, noise_start, 0)
+        )
+
+        new_cache_len = cache_len + actual_ctx_count + T_noise
         max_kv_len = kv_cache_k.shape[2]
 
-        # 4. Flash attention (non-causal) with segment_ids mask
+        # 5. Flash attention (non-causal) with segment_ids mask
         q_4d = q.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
 
         # Simple validity: all slots 0..new_cache_len-1 are valid.
@@ -228,9 +256,6 @@ class DFlashAttention(nnx.Module):
         )
 
         sm_scale = self.head_dim_original ** -0.5
-        # Block sizes: block_q must be <= q_seq_len (T_noise).
-        # Use single-step K processing (block_k = block_k_major = max_kv_len)
-        # since the kernel optimises this path.
         block_sizes = BlockSizes(
             block_q=T_noise,
             block_k_major=max_kv_len,
@@ -325,13 +350,14 @@ class DFlashDecoderLayer(nnx.Module):
         kv_cache_k: jax.Array,
         kv_cache_v: jax.Array,
         cache_len: jax.Array,
+        actual_ctx_count: jax.Array,
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """Returns (hidden_states, new_kv_cache_k, new_kv_cache_v)."""
         residual = x
         x = self.input_layernorm(x)
         x, kv_cache_k, kv_cache_v = self.self_attn(
             x, target_hidden, noise_positions, ctx_positions,
-            kv_cache_k, kv_cache_v, cache_len,
+            kv_cache_k, kv_cache_v, cache_len, actual_ctx_count,
         )
         x = residual + x
 
@@ -481,6 +507,12 @@ class DFlashForCausalLM(nnx.Module):
         dflash_config = getattr(hf_config, "dflash_config", {})
         self.mask_token_id = dflash_config.get("mask_token_id", 0)
 
+        # Position scheme: "incremental" (default) adds cache_len offset,
+        # "reset" starts positions from 0 each iteration (Phase 1 style).
+        self._position_scheme = dflash_config.get(
+            "position_scheme", "incremental"
+        )
+
         self.model = DFlashModel(
             vllm_config=vllm_config, rng=self.rng, mesh=mesh,
         )
@@ -496,11 +528,12 @@ class DFlashForCausalLM(nnx.Module):
     ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array]]:
         """Forward pass for the DFlash draft model.
 
-        ``target_hidden_states`` is a tuple:
-            (ctx_hidden, cache_len_arr)
+        ``target_hidden_states`` is a 3-tuple:
+            (ctx_hidden, cache_len_arr, actual_ctx_count_arr)
         where:
-            ctx_hidden: (T_ctx, D) — new context tokens (all real).
+            ctx_hidden: (T_padded, D) — padded context features.
             cache_len_arr: (1,) int32 — valid entries already in KV cache.
+            actual_ctx_count_arr: (1,) int32 — real (non-padding) context count.
 
         ``kv_caches`` is a flat list of length ``2 * num_layers``:
             [k_cache_0, v_cache_0, k_cache_1, v_cache_1, ...]
@@ -509,35 +542,35 @@ class DFlashForCausalLM(nnx.Module):
         Returns:
             (kv_caches, hidden_states, [target_hidden_states])
         """
-        # Unpack target_hidden_states:
-        #   ctx_hidden: (T_ctx, D) — new context tokens (all real, no padding).
-        #   cache_len_arr: (1,) int32 — valid entries already in KV cache.
-        ctx_hidden, cache_len_arr = target_hidden_states
-        cache_len = cache_len_arr[0]  # scalar
+        ctx_hidden, cache_len_arr, actual_ctx_count_arr = target_hidden_states
+        cache_len = cache_len_arr[0]            # scalar
+        actual_ctx_count = actual_ctx_count_arr[0]  # scalar
 
         # Embed the draft block tokens
         noise_emb = self.model.embed_tokens(input_ids)   # (T_noise, D)
 
-        # Derive positions for NEW context + noise tokens.
-        # GPU DFlash uses position_ids = [cache_seq_len, ..., cache_seq_len + n_ctx + block_size - 1]
-        # where context gets the first n_ctx positions and noise gets the rest.
-        # cache_len = seq_len (synced by proposer), so:
-        #   ctx positions: [cache_len, cache_len+1, ..., cache_len + T_ctx - 1]
-        #   noise positions: [cache_len + T_ctx, ..., cache_len + T_ctx + block_size - 1]
-        T_ctx = ctx_hidden.shape[0]
+        # Position offset: "incremental" uses cache_len, "reset" uses 0.
+        pos_offset = cache_len if self._position_scheme == "incremental" else 0
+
+        # Derive positions for padded context and noise tokens.
+        # Context positions use T_padded dimension but only actual_ctx_count
+        # entries carry real data (the rest are zeroed in attention).
+        # Noise positions start after actual context, not after padding.
+        T_padded = ctx_hidden.shape[0]
         T_noise = input_ids.shape[0]
-        ctx_positions = jnp.arange(T_ctx, dtype=jnp.int32) + cache_len
-        noise_positions = jnp.arange(T_noise, dtype=jnp.int32) + cache_len + T_ctx
+        ctx_positions = jnp.arange(T_padded, dtype=jnp.int32) + pos_offset
+        noise_positions = (
+            jnp.arange(T_noise, dtype=jnp.int32) + pos_offset + actual_ctx_count
+        )
 
         # Run through decoder layers
         x = noise_emb
-        num_layers = len(self.model.layers)
         for i, layer in enumerate(self.model.layers):
             kv_k = kv_caches[2 * i]
             kv_v = kv_caches[2 * i + 1]
             x, kv_k, kv_v = layer(
                 x, ctx_hidden, noise_positions, ctx_positions,
-                kv_k, kv_v, cache_len,
+                kv_k, kv_v, cache_len, actual_ctx_count,
             )
             kv_caches[2 * i] = kv_k
             kv_caches[2 * i + 1] = kv_v
