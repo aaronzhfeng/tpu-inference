@@ -234,6 +234,21 @@ def _get_nnx_model(
     return jit_model
 
 
+def _get_dflash_draft_class(config: PretrainedConfig) -> type:
+    """Resolve DFlash draft model class from draft model config (e.g. model_type).
+
+    Enables config-driven selection so adding Qwen3-8B or other families
+    is a manifest change; Llama DFlash uses LlamaDFlashForCausalLM,
+    Qwen3 and others use DFlashForCausalLM.
+    """
+    model_type = (getattr(config, "model_type", None) or "").lower()
+    if model_type == "llama":
+        from tpu_inference.models.jax.llama_dflash import LlamaDFlashForCausalLM
+        return LlamaDFlashForCausalLM
+    from tpu_inference.models.jax.dflash import DFlashForCausalLM
+    return DFlashForCausalLM
+
+
 # TODO(pooyam): We need to refactor this. This is returning a bunch of functions that do not work with all models and this is not very easy to see from the code.
 def get_flax_model(
     vllm_config: VllmConfig,
@@ -250,8 +265,13 @@ def get_flax_model(
         update_vllm_config_for_qwix_quantization(vllm_config)
 
     if is_draft_model:
-        model_class = _get_model_architecture(
-            vllm_config.speculative_config.draft_model_config.hf_config)
+        draft_hf_config = vllm_config.speculative_config.draft_model_config.hf_config
+        if (
+            getattr(vllm_config.speculative_config, "method", None) == "dflash"
+        ):
+            model_class = _get_dflash_draft_class(draft_hf_config)
+        else:
+            model_class = _get_model_architecture(draft_hf_config)
     else:
         model_class = _get_model_architecture(
             vllm_config.model_config.hf_config)

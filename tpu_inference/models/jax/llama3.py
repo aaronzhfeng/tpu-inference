@@ -304,13 +304,46 @@ class LlamaModel(nnx.Module):
             self.lm_head = PPMissingLayer()
 
         self.aux_hidden_state_layers = []
-        if vllm_config.speculative_config and vllm_config.speculative_config.method == "eagle3":
-            self.aux_hidden_state_layers = self.get_eagle3_aux_hidden_state_layers(
-            )
+        self.capture_aux_after_layer = False
+        if vllm_config.speculative_config:
+            method = getattr(vllm_config.speculative_config, "method", None)
+            if method == "eagle3":
+                self.aux_hidden_state_layers = self.get_eagle3_aux_hidden_state_layers()
+            elif method == "dflash":
+                self.aux_hidden_state_layers = self._get_dflash_aux_layers(
+                    vllm_config
+                )
+                self.capture_aux_after_layer = True
 
     def get_eagle3_aux_hidden_state_layers(self):
         num_layers = len(self.layers)
         return (2, num_layers // 2, num_layers - 3)
+
+    def _get_dflash_aux_layers(self, vllm_config: VllmConfig):
+        """Determine which target-model layers to capture for DFlash."""
+        draft_hf_config = (
+            vllm_config.speculative_config.draft_model_config.hf_config
+        )
+        dflash_config = getattr(draft_hf_config, "dflash_config", {})
+        if isinstance(dflash_config, dict):
+            target_layer_ids = dflash_config.get("target_layer_ids", None)
+        else:
+            target_layer_ids = None
+        if target_layer_ids is not None:
+            return tuple(target_layer_ids)
+        num_target_layers = len(self.layers)
+        num_draft_layers = getattr(draft_hf_config, "num_hidden_layers", None)
+        num_selected = getattr(draft_hf_config, "num_target_layers", None)
+        if num_draft_layers is not None and num_selected is not None:
+            if num_selected == 1:
+                return (num_target_layers // 2,)
+            start, end = 1, num_target_layers - 3
+            span = end - start
+            return tuple(
+                int(round(start + (i * span) / (num_selected - 1)))
+                for i in range(num_selected)
+            )
+        return (num_target_layers // 2,)
 
     def __call__(
         self,
@@ -329,7 +362,7 @@ class LlamaModel(nnx.Module):
         aux_hidden_states = []
         for i, layer in enumerate(
                 islice(self.layers, self.start_layer, self.end_layer)):
-            if i in self.aux_hidden_state_layers:
+            if not self.capture_aux_after_layer and i in self.aux_hidden_state_layers:
                 aux_hidden_states.append(x)
             kv_cache = kv_caches[i]
             kv_cache, x = layer(
@@ -338,6 +371,8 @@ class LlamaModel(nnx.Module):
                 attention_metadata,
             )
             kv_caches[i] = kv_cache
+            if self.capture_aux_after_layer and i in self.aux_hidden_state_layers:
+                aux_hidden_states.append(x)
         if not self.is_last_rank:
             # Note: add aux_hidden_states to make the output spec consistent.
             return kv_caches, JaxIntermediateTensors({"hidden_states":
