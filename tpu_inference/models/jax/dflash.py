@@ -398,12 +398,12 @@ class DFlashModel(nnx.Module):
         )
 
         # Decoder layers
-        self.layers = [
+        self.layers = nnx.List([
             DFlashDecoderLayer(
                 config=hf_config, dtype=dtype, rng=rng, mesh=mesh,
             )
             for _ in range(hf_config.num_hidden_layers)
-        ]
+        ])
 
         # FC: projects concatenated target hidden states to hidden_size
         dflash_config = getattr(hf_config, "dflash_config", {})

@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
 import jax.numpy as jnp
@@ -23,9 +23,12 @@ from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
+from tpu_inference.logger import init_logger
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 from tpu_inference.utils import device_array
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from tpu_inference.layers.common.attention_metadata import \
@@ -37,6 +40,7 @@ if TYPE_CHECKING:
 class SpecDecodeMetadata:
     """Metadata for speculative decoding on JAX/TPU, containing all necessary indices."""
     draft_token_ids: jnp.ndarray
+    draft_token_probs: Optional[jnp.ndarray]
     draft_lengths: jnp.ndarray
     draft_lengths_cpu: np.ndarray
     target_logits_indices: jnp.ndarray
@@ -50,6 +54,8 @@ class SpeculativeDecodingManager:
         self.runner = runner
         # Cached draft tokens.
         self._draft_token_ids: Optional[list[list[int]]] = None
+        # Optional per-token draft probabilities aligned with cached draft IDs.
+        self._draft_token_probs: Optional[list[list[float]]] = None
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         if self._draft_token_ids is None:
@@ -74,7 +80,18 @@ class SpeculativeDecodingManager:
                 sampled_token_ids[:self.runner.input_batch.num_reqs],
                 self.runner.input_batch.num_tokens_no_spec,
                 self.runner.input_batch.token_ids_cpu)
+            self._draft_token_probs = None
         elif self.runner.speculative_config.method == "eagle3":
+            self._draft_token_ids = self.propose_eagle3_draft_token_ids(
+                sampled_token_ids,
+                aux_hidden_states,
+                attn_metadata,
+                spec_decode_metadata,
+                scheduler_output,
+                input_ids,
+            )
+        elif self.runner.speculative_config.method == "dflash":
+            # DFlash reuses the same propose flow as Eagle3
             self._draft_token_ids = self.propose_eagle3_draft_token_ids(
                 sampled_token_ids,
                 aux_hidden_states,
@@ -97,7 +114,9 @@ class SpeculativeDecodingManager:
         scheduler_output: VllmSchedulerOutput,
         input_ids: jnp.ndarray,
     ) -> list[list[int]]:
-        assert isinstance(self.runner.drafter, Eagle3Proposer)
+        # Supports both Eagle3Proposer and DFlashProposer (same interface)
+        assert hasattr(self.runner.drafter, 'prepare_inputs') and hasattr(
+            self.runner.drafter, 'propose')
 
         # TODO(woosuk): Refactor the loop.
         req_ids = self.runner.input_batch.req_ids
@@ -139,24 +158,53 @@ class SpeculativeDecodingManager:
                 self.runner.mesh, np.array(num_rejected_tokens,
                                            dtype=jnp.int32))
 
-        target_hidden_states, input_ids, last_token_indices, attn_metadata = self.runner.drafter.prepare_inputs(
+        # Use the actual accepted seq_len (num_tokens_no_spec) instead of
+        # attn_metadata.seq_lens which includes unverified draft tokens.
+        # The attn_metadata.seq_lens = num_computed + num_scheduled, where
+        # num_scheduled includes all draft tokens being verified. But the
+        # proposer needs the ACCEPTED count to correctly track its context
+        # buffer and KV cache positions.
+        accepted_seq_lens = self.runner.input_batch.num_tokens_no_spec[
+            :attn_metadata.seq_lens.shape[0]].copy()
+        accepted_attn_metadata = replace(
             attn_metadata,
+            seq_lens=device_array(
+                self.runner.mesh,
+                accepted_seq_lens.astype(np.int32)),
+        )
+
+        target_hidden_states, input_ids, last_token_indices, attn_metadata = self.runner.drafter.prepare_inputs(
+            accepted_attn_metadata,
             input_ids,
             aux_hidden_states,
             next_token_ids,
             num_rejected_tokens,
         )
 
-        self.runner.kv_caches, draft_token_ids = self.runner.drafter.propose(
+        propose_output = self.runner.drafter.propose(
             kv_caches=self.runner.kv_caches,
             input_ids=input_ids,
             attn_metadata=attn_metadata,
             last_token_indices=last_token_indices,
             target_hidden_states=target_hidden_states,
         )
+        if len(propose_output) == 3:
+            self.runner.kv_caches, draft_token_ids, draft_token_probs = (
+                propose_output)
+        else:
+            self.runner.kv_caches, draft_token_ids = propose_output
+            draft_token_probs = None
         draft_token_ids = np.array(draft_token_ids)
         if draft_token_ids.ndim == 1:
             draft_token_ids = np.expand_dims(draft_token_ids, axis=-1)
+        if draft_token_probs is None:
+            self._draft_token_probs = None
+        else:
+            draft_token_probs = np.asarray(draft_token_probs,
+                                           dtype=np.float32)
+            if draft_token_probs.ndim == 1:
+                draft_token_probs = np.expand_dims(draft_token_probs, axis=-1)
+            self._draft_token_probs = draft_token_probs.tolist()
         return draft_token_ids.tolist()
 
     def get_spec_decode_metadata(
@@ -240,6 +288,28 @@ class SpeculativeDecodingManager:
         ])
 
         padded_num_draft_tokens_cpu = padded_num_draft_tokens
+        padded_draft_token_probs = None
+        if self._draft_token_probs is not None:
+            draft_token_probs: list[float] = []
+            for req_idx, num_tokens in enumerate(num_draft_tokens):
+                num_tokens = int(num_tokens)
+                if num_tokens <= 0:
+                    continue
+                req_probs = []
+                if req_idx < len(self._draft_token_probs):
+                    req_probs = self._draft_token_probs[req_idx]
+                req_probs = [float(x) for x in req_probs[:num_tokens]]
+                if len(req_probs) < num_tokens:
+                    req_probs.extend([1.0] * (num_tokens - len(req_probs)))
+                draft_token_probs.extend(req_probs)
+            padded_draft_token_probs = np.concatenate([
+                np.asarray(draft_token_probs, dtype=np.float32),
+                np.ones(
+                    padded_logits_length - len(draft_token_probs),
+                    dtype=np.float32,
+                ),
+            ])
+
         # CPU -> TPU copy.
         (padded_num_draft_tokens, padded_draft_token_ids,
          padded_logits_indices, padded_target_logits_indices,
@@ -248,13 +318,18 @@ class SpeculativeDecodingManager:
              (padded_num_draft_tokens, padded_draft_token_ids,
               padded_logits_indices, padded_target_logits_indices,
               padded_bonus_logits_indices))
+        if padded_draft_token_probs is not None:
+            padded_draft_token_probs = device_array(self.runner.mesh,
+                                                    padded_draft_token_probs)
 
         metadata = SpecDecodeMetadata(
             draft_token_ids=padded_draft_token_ids,
+            draft_token_probs=padded_draft_token_probs,
             draft_lengths=padded_num_draft_tokens,
             draft_lengths_cpu=padded_num_draft_tokens_cpu,
             target_logits_indices=padded_target_logits_indices,
             bonus_logits_indices=padded_bonus_logits_indices,
             final_logits_indices=padded_logits_indices,
         )
+        self._draft_token_probs = None
         return metadata
