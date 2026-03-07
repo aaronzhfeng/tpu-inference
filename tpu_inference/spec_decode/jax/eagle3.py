@@ -72,18 +72,21 @@ class Eagle3Proposer:
             self.vllm_config, self.rng_key, self.mesh, is_draft_model=True)
 
         draft_embed_tokens = getattr(self.state.model, 'embed_tokens', None)
+        target_embed = getattr(target_model.model, 'embed_tokens', None)
+        if target_embed is None:
+            target_embed = getattr(target_model.model, 'embed', None)
         if draft_embed_tokens is None or ~jnp.any(
                 draft_embed_tokens.embedding):
             logger.info(
                 "Draft model does not have embedding. Setting draft model's embed_tokens to target model's embed"
             )
-            self.state.model.embed_tokens = target_model.model.embed
-        elif jnp.array_equal(draft_embed_tokens.embedding,
-                             target_model.model.embed.embedding):
+            self.state.model.embed_tokens = target_embed
+        elif target_embed is not None and jnp.array_equal(
+                draft_embed_tokens.embedding, target_embed.embedding):
             logger.info(
-                "Draft model's embed_tokens is identical to target model's embed. Sharing the embedding."
+                "Draft model's embed_tokens is identical to target model. Sharing the embedding."
             )
-            self.state.model.embed_tokens = target_model.model.embed
+            self.state.model.embed_tokens = target_embed
         else:
             logger.info("Draft model has its own embed_tokens.")
 
@@ -226,9 +229,14 @@ class Eagle3Proposer:
             return target_hidden_states, input_ids, last_token_indices, attn_metadata
 
         # Host copies from the metadata prepared by the runner.
-        query_start_loc_cpu = attn_metadata.query_start_loc_cpu
-        seq_lens_cpu = attn_metadata.seq_lens_cpu
-        assert query_start_loc_cpu is not None and seq_lens_cpu is not None
+        # Fallback: some AttentionMetadata may not have _cpu attributes.
+        query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+        seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+        if query_start_loc_cpu is None or seq_lens_cpu is None:
+            query_start_loc_cpu = np.asarray(
+                jax.device_get(attn_metadata.query_start_loc), dtype=np.int32)
+            seq_lens_cpu = np.asarray(
+                jax.device_get(attn_metadata.seq_lens), dtype=np.int32)
 
         # Rejection-aware path: compute new per-request lengths and token indices.
         # Convert to host numpy for efficient prefix-sum and repeat ops.
