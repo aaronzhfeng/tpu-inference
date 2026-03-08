@@ -22,7 +22,10 @@ import vllm.envs as envs
 from jax.sharding import NamedSharding, PartitionSpec
 from torchax.ops.mappings import t2j_dtype
 from vllm.config import get_layers_from_vllm_config
-from vllm.model_executor.layers.attention import Attention
+try:
+    from vllm.model_executor.layers.attention import Attention
+except ImportError:
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase as Attention
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,

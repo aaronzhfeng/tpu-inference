@@ -15,7 +15,10 @@
 from typing import Any, Optional
 
 import jax
-from jax.experimental import transfer
+try:
+    from jax.experimental import transfer
+except ImportError:
+    transfer = None
 
 BASE_JAX_PORT = 5000
 

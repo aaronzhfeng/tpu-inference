@@ -13,7 +13,13 @@ from jax._src import dtypes
 from jax._src import mesh as mesh_lib
 from jax._src import xla_bridge as xb
 from jax._src.lib import xla_client as xc
-from jax._src.numpy.scalar_types import _ScalarMeta
+try:
+    from jax._src.numpy.scalar_types import _ScalarMeta
+except ImportError:
+    try:
+        from jax._src.numpy.lax_numpy import _ScalarMeta
+    except ImportError:
+        _ScalarMeta = type(None)
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torchax.ops.mappings import j2t_dtype, t2j_dtype
 from vllm import envs as vllm_envs

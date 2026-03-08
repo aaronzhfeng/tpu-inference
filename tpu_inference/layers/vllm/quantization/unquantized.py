@@ -21,7 +21,10 @@ from torch.nn import Parameter
 from torchax.interop import jax_view, torch_view
 from torchax.ops.mappings import t2j
 from vllm.model_executor.layers import linear as vllm_linear
-from vllm.model_executor.layers.attention import Attention
+try:
+    from vllm.model_executor.layers.attention import Attention
+except ImportError:
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase as Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEConfig,
                                                   UnquantizedFusedMoEMethod)
 from vllm.model_executor.layers.quantization import \

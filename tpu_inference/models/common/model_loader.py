@@ -24,17 +24,26 @@ from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.runai_streamer_loader import \
     RunaiModelStreamerLoader
-from vllm.utils.func_utils import supports_kw
+try:
+    from vllm.utils.func_utils import supports_kw
+except ImportError:
+    from vllm.utils import supports_kw
 
 from tpu_inference import envs
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.quantization import get_tpu_quantization_config
 from tpu_inference.logger import init_logger
-from tpu_inference.models.jax.utils.qwix.qwix_utils import (
-    apply_qwix_on_abstract_model, apply_qwix_quantization,
-    load_random_weights_into_qwix_abstract_model,
-    update_vllm_config_for_qwix_quantization)
+try:
+    from tpu_inference.models.jax.utils.qwix.qwix_utils import (
+        apply_qwix_on_abstract_model, apply_qwix_quantization,
+        load_random_weights_into_qwix_abstract_model,
+        update_vllm_config_for_qwix_quantization)
+except (ImportError, AttributeError):
+    apply_qwix_on_abstract_model = lambda *a, **kw: None
+    apply_qwix_quantization = lambda *a, **kw: None
+    load_random_weights_into_qwix_abstract_model = lambda *a, **kw: None
+    update_vllm_config_for_qwix_quantization = lambda *a, **kw: None
 from tpu_inference.models.jax.utils.weight_utils import (BaseWeightLoader,
                                                          LoadableWithIterator)
 from tpu_inference.utils import to_jax_dtype, to_torch_dtype
