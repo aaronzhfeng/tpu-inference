@@ -90,8 +90,9 @@ class SpeculativeDecodingManager:
                 scheduler_output,
                 input_ids,
             )
-        elif self.runner.speculative_config.method == "dflash":
-            # DFlash reuses the same propose flow as Eagle3
+        elif self.runner.speculative_config.method in ("dflash",
+                                                         "dflash_torchax"):
+            # DFlash (JAX and torchax) reuses the same propose flow as Eagle3
             self._draft_token_ids = self.propose_eagle3_draft_token_ids(
                 sampled_token_ids,
                 aux_hidden_states,

@@ -60,6 +60,7 @@ class _DFlashRunner(torch.nn.Module):
         noise_embedding: torch.Tensor,
         target_hidden: torch.Tensor,
         position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the DFlash model (no KV cache, no causal mask).
 
@@ -69,6 +70,8 @@ class _DFlashRunner(torch.nn.Module):
                            target hidden states (NOT yet projected).
             position_ids: (1, ctx_len + block_size) positions for RoPE
                           covering both context and noise.
+            attention_mask: (1, ctx_len + block_size) binary mask where 1
+                           indicates a valid position and 0 indicates padding.
         Returns:
             hidden_states: (1, block_size, D) – the draft model output
                            after the final norm (before lm_head).
@@ -77,6 +80,7 @@ class _DFlashRunner(torch.nn.Module):
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
             position_ids=position_ids,
+            attention_mask=attention_mask,
             past_key_values=None,
             use_cache=False,
             is_causal=False,
@@ -177,7 +181,8 @@ class DFlashTorchaxWrapper:
         Signature::
 
             draft_forward(params, noise_input_ids, target_hidden,
-                          position_ids, embed_weight) -> hidden_states
+                          position_ids, embed_weight,
+                          attention_mask) -> hidden_states
         """
         model = self.model
 
@@ -192,6 +197,7 @@ class DFlashTorchaxWrapper:
             target_hidden: jax.Array,
             position_ids: jax.Array,
             embed_weight: jax.Array,
+            attention_mask: jax.Array,
         ) -> jax.Array:
             with torchax.default_env():
                 p = torch_view(params)
@@ -203,6 +209,7 @@ class DFlashTorchaxWrapper:
 
                 target_h = torch_view(target_hidden).unsqueeze(0)  # (1, C, D')
                 pos = torch_view(position_ids).unsqueeze(0)        # (1, C+B)
+                mask = torch_view(attention_mask).unsqueeze(0)     # (1, C+B)
 
                 output = torch.func.functional_call(
                     model, p,
@@ -210,6 +217,7 @@ class DFlashTorchaxWrapper:
                         "noise_embedding": noise_emb,
                         "target_hidden": target_h,
                         "position_ids": pos,
+                        "attention_mask": mask,
                     },
                     tie_weights=False,
                 )
