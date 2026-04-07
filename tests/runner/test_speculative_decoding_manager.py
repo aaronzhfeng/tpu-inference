@@ -111,8 +111,9 @@ class TestSpeculativeDecodingManager:
         self.runner.drafter = MagicMock(spec=DFlashProposer)
         self.runner.speculative_config.method = "dflash"
 
+        # DFlash reuses the Eagle3 propose flow
         with patch.object(self.runner.speculative_decoding_manager,
-                          'propose_dflash_draft_token_ids',
+                          'propose_eagle3_draft_token_ids',
                           return_value=[[12, 13]]) as mock_propose_dflash:
             self.runner.speculative_decoding_manager.propose_draft_token_ids(
                 sampled_token_ids=[[1]],
@@ -324,7 +325,7 @@ class TestSpeculativeDecodingManager:
         "method,propose_method_name,drafter_cls",
         [
             ("eagle3", "propose_eagle3_draft_token_ids", Eagle3Proposer),
-            ("dflash", "propose_dflash_draft_token_ids", DFlashProposer),
+            ("dflash", "propose_eagle3_draft_token_ids", DFlashProposer),
         ],
     )
     @pytest.mark.parametrize("spec_decode_metadata_is_none", [True, False])

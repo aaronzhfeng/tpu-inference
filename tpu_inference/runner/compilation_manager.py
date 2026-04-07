@@ -648,8 +648,9 @@ class CompilationManager:
         self._precompile_rejection_sampler()
         if self.runner.speculative_config.method == "eagle3":
             self._precompile_eagle3_helpers()
-        # DFlash uses manual attention (no KV cache) and does not require
-        # the Eagle3-specific jit precompilation helpers.
+        elif self.runner.speculative_config.method in ("dflash",
+                                                        "dflash_torchax"):
+            self._precompile_dflash_helpers()
 
     def _precompile_rejection_sampler(self) -> None:
         logger.info("Compiling rejection_sampler with different input shapes.")
@@ -956,6 +957,62 @@ class CompilationManager:
                 hidden_states,
                 last_token_indices,
                 num_tokens=num_tokens,
+            )
+
+    def _precompile_dflash_helpers(self) -> None:
+        logger.info(
+            "Compiling dflash jitted helpers with different input shapes.")
+        drafter = self.runner.drafter
+        target_hidden_size = (
+            self.runner.model_config.get_hidden_size())
+        draft_hidden_size = (
+            self.runner.speculative_config
+            .draft_model_config.get_hidden_size())
+        dtype = self.runner.model_config.dtype
+
+        # _build_noise_block: (self, seq_len_arr, next_token_ids,
+        #                      mask_token_id, block_size)
+        seq_len_arr = self._create_dummy_tensor((1,), jnp.int32)
+        next_token_ids = self._create_dummy_tensor(
+            (self.runner.max_num_reqs,), jnp.int32)
+        self._run_compilation(
+            "dflash_build_noise_block",
+            drafter._build_noise_block,
+            seq_len_arr,
+            next_token_ids,
+            drafter.mask_token_id,
+            drafter.block_size,
+        )
+
+        # _project_aux_hidden: (self, state, aux_hidden_states)
+        # aux_hidden_states is a tuple of per-layer arrays.
+        if hasattr(drafter, 'state'):
+            num_target_layers = getattr(
+                drafter, '_num_target_layers',
+                drafter.draft_model_config.hf_config.num_hidden_layers)
+            for num_tokens in self.runner.num_tokens_paddings:
+                aux_hidden_states = tuple(
+                    self._create_dummy_tensor(
+                        (num_tokens, target_hidden_size), jnp.bfloat16)
+                    for _ in range(num_target_layers)
+                )
+                self._run_compilation(
+                    "dflash_project_aux_hidden",
+                    drafter._project_aux_hidden,
+                    drafter.state,
+                    aux_hidden_states,
+                    num_tokens=num_tokens,
+                )
+
+        # _sample_block_draft_tokens: (self, state, hidden_states)
+        if hasattr(drafter, 'state'):
+            hidden_states = self._create_dummy_tensor(
+                (drafter.block_size, draft_hidden_size), jnp.bfloat16)
+            self._run_compilation(
+                "dflash_sample_block_draft_tokens",
+                drafter._sample_block_draft_tokens,
+                drafter.state,
+                hidden_states,
             )
 
     def _precompile_structured_decoding(self) -> None:
