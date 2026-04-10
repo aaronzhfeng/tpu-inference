@@ -292,6 +292,7 @@ class CompilationManager:
 
                 input_ids = self._create_dummy_tensor((num_tokens, ),
                                                       jnp.int32, dp_sharding)
+                # Need align to the sampling output sharding (sharded by ATTN_DATA in DP)
                 next_tokens = self._create_dummy_tensor(
                     (num_reqs, ),
                     jnp.int32,
@@ -540,7 +541,7 @@ class CompilationManager:
             # function.
             sampling_metadata_sharding = NamedSharding(
                 self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
-            logits = self._create_dummy_tensor((num_reqs, hsize), jnp.float32,
+            logits = self._create_dummy_tensor((num_reqs, hsize), jnp.bfloat16,
                                                logits_sharding)
             for do_sampling in (True, False):
                 for logprobs in (True, False):
@@ -617,12 +618,15 @@ class CompilationManager:
         logger.info("Compiling gather_logprobs with different input shapes.")
         hsize = self.runner.model_config.get_vocab_size()
         for num_reqs in self.runner.num_reqs_paddings:
+            dp_size = self.runner.vllm_config.sharding_config.total_dp_size
             logits_sharding = NamedSharding(
                 self.runner.mesh,
                 PartitionSpec(ShardingAxisName.MLP_DATA,
                               ShardingAxisName.MLP_TENSOR))
-            token_ids_sharding = NamedSharding(self.runner.mesh,
-                                               PartitionSpec())
+            token_ids_sharding = NamedSharding(
+                self.runner.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, )
+            ) if dp_size > 1 else NamedSharding(self.runner.mesh,
+                                                PartitionSpec())
             logits = self._create_dummy_tensor((num_reqs, hsize), jnp.float32,
                                                logits_sharding)
             token_ids = self._create_dummy_tensor((num_reqs, ), jnp.int32,
@@ -644,6 +648,9 @@ class CompilationManager:
         self._precompile_rejection_sampler()
         if self.runner.speculative_config.method == "eagle3":
             self._precompile_eagle3_helpers()
+        elif self.runner.speculative_config.method in ("dflash",
+                                                        "dflash_torchax"):
+            self._precompile_dflash_helpers()
 
     def _precompile_rejection_sampler(self) -> None:
         logger.info("Compiling rejection_sampler with different input shapes.")
@@ -655,7 +662,7 @@ class CompilationManager:
                     PartitionSpec(ShardingAxisName.MLP_DATA,
                                   ShardingAxisName.MLP_TENSOR))
                 target_probs = self._create_dummy_tensor(
-                    (num_logits, vocab_size), jnp.float32, sharding)
+                    (num_logits, vocab_size), jnp.bfloat16, sharding)
                 draft_token_ids = self._create_dummy_tensor((num_logits, ),
                                                             jnp.int32)
                 num_draft_tokens = self._create_dummy_tensor((num_reqs, ),
@@ -675,8 +682,11 @@ class CompilationManager:
                         _cache_collision_dummy,
                         NamedSharding(self.runner.mesh, PartitionSpec(None)))
 
+                    draft_token_probs = None
                     if do_sampling:
                         compilation_name = "random_rejection_sampler"
+                        draft_token_probs = self._create_dummy_tensor(
+                            (num_logits, ), np.float32)
                         temperature = self._create_dummy_tensor((num_reqs, ),
                                                                 np.float32)
                         top_k = self._create_dummy_tensor((num_reqs, ),
@@ -705,6 +715,7 @@ class CompilationManager:
                         bonus_token_ids,
                         sampling_metadata,
                         self.runner.rng_params_for_sampling,
+                        draft_token_probs,
                         num_logits=num_logits,
                         num_reqs=num_reqs,
                         do_sampling=do_sampling,
@@ -946,6 +957,62 @@ class CompilationManager:
                 hidden_states,
                 last_token_indices,
                 num_tokens=num_tokens,
+            )
+
+    def _precompile_dflash_helpers(self) -> None:
+        logger.info(
+            "Compiling dflash jitted helpers with different input shapes.")
+        drafter = self.runner.drafter
+        target_hidden_size = (
+            self.runner.model_config.get_hidden_size())
+        draft_hidden_size = (
+            self.runner.speculative_config
+            .draft_model_config.get_hidden_size())
+        dtype = self.runner.model_config.dtype
+
+        # _build_noise_block: (self, seq_len_arr, next_token_ids,
+        #                      mask_token_id, block_size)
+        seq_len_arr = self._create_dummy_tensor((1,), jnp.int32)
+        next_token_ids = self._create_dummy_tensor(
+            (self.runner.max_num_reqs,), jnp.int32)
+        self._run_compilation(
+            "dflash_build_noise_block",
+            drafter._build_noise_block,
+            seq_len_arr,
+            next_token_ids,
+            drafter.mask_token_id,
+            drafter.block_size,
+        )
+
+        # _project_aux_hidden: (self, state, aux_hidden_states)
+        # aux_hidden_states is a tuple of per-layer arrays.
+        if hasattr(drafter, 'state'):
+            num_target_layers = getattr(
+                drafter, '_num_target_layers',
+                drafter.draft_model_config.hf_config.num_hidden_layers)
+            for num_tokens in self.runner.num_tokens_paddings:
+                aux_hidden_states = tuple(
+                    self._create_dummy_tensor(
+                        (num_tokens, target_hidden_size), jnp.bfloat16)
+                    for _ in range(num_target_layers)
+                )
+                self._run_compilation(
+                    "dflash_project_aux_hidden",
+                    drafter._project_aux_hidden,
+                    drafter.state,
+                    aux_hidden_states,
+                    num_tokens=num_tokens,
+                )
+
+        # _sample_block_draft_tokens: (self, state, hidden_states)
+        if hasattr(drafter, 'state'):
+            hidden_states = self._create_dummy_tensor(
+                (drafter.block_size, draft_hidden_size), jnp.bfloat16)
+            self._run_compilation(
+                "dflash_sample_block_draft_tokens",
+                drafter._sample_block_draft_tokens,
+                drafter.state,
+                hidden_states,
             )
 
     def _precompile_structured_decoding(self) -> None:
