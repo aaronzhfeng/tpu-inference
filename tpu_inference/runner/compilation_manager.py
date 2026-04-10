@@ -715,7 +715,6 @@ class CompilationManager:
                         bonus_token_ids,
                         sampling_metadata,
                         self.runner.rng_params_for_sampling,
-                        draft_token_probs,
                         num_logits=num_logits,
                         num_reqs=num_reqs,
                         do_sampling=do_sampling,
