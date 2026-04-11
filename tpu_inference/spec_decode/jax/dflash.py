@@ -260,12 +260,14 @@ class DFlashProposer:
         self._diag_count += 1
         if self._diag_count <= 30:  # First 30 steps
             _aux_shape = aux_hidden_states[0].shape if aux_hidden_states else "none"
-            _proj_shape = projected.shape if num_new > 0 else "skipped"
-            print(f"DIAG step={self._diag_count} seq_len={seq_len} prev_seq_len={self._prev_seq_len} "
+            # Fingerprint: aux hidden norm at position 0
+            _aux_norm = float(jnp.linalg.norm(jax.device_get(aux_hidden_states[0][0]))) if aux_hidden_states else 0
+            _proj_norm = float(jnp.linalg.norm(jax.device_get(projected[0]))) if num_new > 0 else 0
+            print(f"DIAG step={self._diag_count} seq_len={seq_len} prev_seq={self._prev_seq_len} "
                   f"cache_len={self._cache_len} ctx_len={self._ctx_len} num_new={num_new} "
-                  f"n_copy={actual_new_ctx_count} aux_shape={_aux_shape} proj_shape={_proj_shape} "
+                  f"n_copy={actual_new_ctx_count} "
                   f"next_tok={int(jax.device_get(next_token_ids[0]))} "
-                  f"noise_pos_start={seq_len}",
+                  f"aux0_norm={_aux_norm:.2f} proj0_norm={_proj_norm:.2f}",
                   file=sys.stderr, flush=True)
 
         # 6. Build noise block — reuse pre-allocated scalar buffer
@@ -364,12 +366,16 @@ class DFlashProposer:
         if draft_token_ids.ndim == 1:
             draft_token_ids = draft_token_ids[jnp.newaxis, :]
 
-        # DIAGNOSTIC: Log draft output
+        # DIAGNOSTIC: Log draft output + hidden state fingerprint
         import sys
         if hasattr(self, '_diag_count') and self._diag_count <= 30:
             _dt = jax.device_get(draft_token_ids[0])[:5]
+            _hs = jax.device_get(hidden_states)
+            # Log per-position hidden norm to see if attention is working
+            _norms = [float(jnp.linalg.norm(_hs[i])) for i in range(min(4, _hs.shape[0]))]
             print(f"DIAG propose: cache_len_after={self._cache_len} "
-                  f"draft_ids={list(_dt)}",
+                  f"draft_ids={list(_dt)} "
+                  f"hidden_norms={[f'{n:.1f}' for n in _norms]}",
                   file=sys.stderr, flush=True)
 
         # Pass the FRAMEWORK kv_caches through unchanged
