@@ -98,19 +98,25 @@ class DFlashProposer:
                       is_draft_model=True)
 
         # Share the target model's embedding with the draft model.
+        # IMPORTANT: Copy embedding VALUES only, not the entire module.
+        # The target uses JaxEmbed (stores param as .weight) while the draft
+        # uses nnx.Embed (stores param as .embedding). Replacing the entire
+        # module breaks the graphdef-state pytree alignment, causing the
+        # JIT'd forward to use corrupted embeddings.
         draft_embed = getattr(self.state.model, "embed_tokens", None)
         target_embed = getattr(target_model.model, "embed_tokens", None)
         if target_embed is None:
             target_embed = getattr(target_model.model, "embed", None)
-        if target_embed is not None:
-            if draft_embed is None or not jnp.any(draft_embed.embedding):
+        if target_embed is not None and draft_embed is not None:
+            target_embed_value = target_embed.embedding.value
+            draft_embed_value = draft_embed.embedding.value
+            if not jnp.any(draft_embed_value):
                 logger.info(
                     "Sharing target model embedding with DFlash draft model.")
-                self.state.model.embed_tokens = target_embed
-            elif jnp.array_equal(draft_embed.embedding,
-                                 target_embed.embedding):
+                draft_embed.embedding.value = target_embed_value
+            elif jnp.array_equal(draft_embed_value, target_embed_value):
                 logger.info("Draft embedding identical to target; sharing.")
-                self.state.model.embed_tokens = target_embed
+                draft_embed.embedding.value = target_embed_value
 
         # Allocate on-device KV caches
         hf_config = self.draft_model_config.hf_config
