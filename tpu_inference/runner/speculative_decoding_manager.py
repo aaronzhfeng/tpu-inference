@@ -174,6 +174,7 @@ class SpeculativeDecodingManager:
             self._diag_sdm_count = 0
         self._diag_sdm_count += 1
         if self._diag_sdm_count <= 30:
+            import jax
             _orig_sl = int(jax.device_get(attn_metadata.seq_lens[0]))
             _accepted_sl = int(accepted_seq_lens[0])
             _delta = _orig_sl - _accepted_sl
