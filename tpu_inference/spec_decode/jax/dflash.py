@@ -361,8 +361,23 @@ class DFlashProposer:
         target_hidden_states,
     ) -> tuple[list[jax.Array], jnp.ndarray]:
         """Generate all draft tokens in one forward pass."""
-        # Use our own on-device KV caches
-        draft_kv_caches, hidden_states, _ = self.model_fn(
+        # BYPASS TEST: Call draft model directly with minimal JIT
+        # (no out_shardings, no donate_argnums) to isolate the tau bug.
+        if not hasattr(self, '_bypass_fn'):
+            from flax import nnx
+            _graphdef = self.model_fn.args[0]  # Extract from partial
+
+            @jax.jit
+            def _bypass_forward(state, kv_caches, input_ids, target_hidden, attn_md):
+                model = nnx.merge(_graphdef, state)
+                return model(kv_caches, input_ids, target_hidden, attn_md)
+
+            self._bypass_fn = _bypass_forward
+            import sys
+            print("BYPASS: Using direct JIT (no out_shardings, no donate_argnums)",
+                  file=sys.stderr, flush=True)
+
+        draft_kv_caches, hidden_states, _ = self._bypass_fn(
             self.state,
             self._draft_kv_caches,
             input_ids,
