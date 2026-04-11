@@ -253,6 +253,21 @@ class DFlashProposer:
                 ctx = jnp.concatenate([ctx, pad], axis=0)
             new_ctx_jax = device_array(self.mesh, ctx)
 
+        # DIAGNOSTIC: Log state for comparison with standalone
+        import sys
+        if not hasattr(self, '_diag_count'):
+            self._diag_count = 0
+        self._diag_count += 1
+        if self._diag_count <= 30:  # First 30 steps
+            _aux_shape = aux_hidden_states[0].shape if aux_hidden_states else "none"
+            _proj_shape = projected.shape if num_new > 0 else "skipped"
+            print(f"DIAG step={self._diag_count} seq_len={seq_len} prev_seq_len={self._prev_seq_len} "
+                  f"cache_len={self._cache_len} ctx_len={self._ctx_len} num_new={num_new} "
+                  f"n_copy={actual_new_ctx_count} aux_shape={_aux_shape} proj_shape={_proj_shape} "
+                  f"next_tok={int(jax.device_get(next_token_ids[0]))} "
+                  f"noise_pos_start={seq_len}",
+                  file=sys.stderr, flush=True)
+
         # 6. Build noise block — reuse pre-allocated scalar buffer
         if not hasattr(self, '_scalar_buf'):
             self._scalar_buf = np.zeros(1, dtype=np.int32)
@@ -348,6 +363,14 @@ class DFlashProposer:
 
         if draft_token_ids.ndim == 1:
             draft_token_ids = draft_token_ids[jnp.newaxis, :]
+
+        # DIAGNOSTIC: Log draft output
+        import sys
+        if hasattr(self, '_diag_count') and self._diag_count <= 30:
+            _dt = jax.device_get(draft_token_ids[0])[:5]
+            print(f"DIAG propose: cache_len_after={self._cache_len} "
+                  f"draft_ids={list(_dt)}",
+                  file=sys.stderr, flush=True)
 
         # Pass the FRAMEWORK kv_caches through unchanged
         return kv_caches, draft_token_ids
