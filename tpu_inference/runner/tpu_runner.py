@@ -847,6 +847,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output) as kv_connector_output:
                 # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
                 # but one of them would be `None`
+                import time as _time
+                _bb_t0 = _time.perf_counter()
                 (self.kv_caches, hidden_states,
                  aux_hidden_states) = self.model_fn(
                      self.state,
@@ -861,6 +863,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      self.is_first_rank,
                      self.is_last_rank,
                  )
+                _bb_t1 = _time.perf_counter()
+                import sys
+                print(f"PROFILE backbone: {(_bb_t1-_bb_t0)*1000:.2f}ms", file=sys.stderr, flush=True)
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
@@ -974,7 +979,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             )
             _rs_t2 = _time.perf_counter()
             import sys
-            print(f"PROFILE rejection: select={(_rs_t1-_rs_t0)*1000:.2f}ms sampler={(_rs_t2-_rs_t1)*1000:.2f}ms", file=sys.stderr, flush=True)
+            # Measure tau: count accepted tokens (non -1) per request
+            _nt_np = jax.device_get(next_tokens)
+            _num_draft = jax.device_get(spec_decode_metadata.draft_lengths)
+            _accepted = int((_nt_np != -1).sum())
+            _total_draft = int(_num_draft.sum())
+            print(f"PROFILE rejection: select={(_rs_t1-_rs_t0)*1000:.2f}ms sampler={(_rs_t2-_rs_t1)*1000:.2f}ms accepted={_accepted} drafted={_total_draft}", file=sys.stderr, flush=True)
 
         with self.maybe_forbid_compile:
             if tpu_sampling_metadata.logprobs:
