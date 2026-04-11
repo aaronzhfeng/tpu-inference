@@ -1003,14 +1003,16 @@ class CompilationManager:
                     num_tokens=num_tokens,
                 )
 
-        # _sample_block_draft_tokens: (self, state, hidden_states)
-        if hasattr(drafter, 'state'):
+        # _sample_block_draft_tokens: (self, target_state, hidden_states)
+        # Uses the TARGET model's LM head, so needs target_state.
+        target_state = getattr(drafter, 'target_state', drafter.state)
+        if target_state is not None:
             hidden_states = self._create_dummy_tensor(
                 (drafter.block_size, draft_hidden_size), jnp.bfloat16)
             self._run_compilation(
                 "dflash_sample_block_draft_tokens",
                 drafter._sample_block_draft_tokens,
-                drafter.state,
+                target_state,
                 hidden_states,
             )
 
