@@ -193,9 +193,8 @@ class SpeculativeDecodingManager:
             target_hidden_states=target_hidden_states,
         )
         _t2 = _time.perf_counter()
-        import logging
-        logging.getLogger('dflash.profile').info(
-            f"PROFILE propose: prepare={(_t1-_t0)*1000:.2f}ms draft={(_t2-_t1)*1000:.2f}ms total={(_t2-_t0)*1000:.2f}ms")
+        import sys
+        print(f"PROFILE propose: prepare={(_t1-_t0)*1000:.2f}ms draft={(_t2-_t1)*1000:.2f}ms total={(_t2-_t0)*1000:.2f}ms", file=sys.stderr, flush=True)
         if len(propose_output) == 3:
             self.runner.kv_caches, draft_token_ids, draft_token_probs = (
                 propose_output)
