@@ -173,6 +173,8 @@ class SpeculativeDecodingManager:
                 self.runner.mesh,
                 accepted_seq_lens.astype(np.int32)),
         )
+        # Attach CPU-side seq_lens so prepare_inputs can avoid device_get sync
+        accepted_attn_metadata._cpu_seq_lens = accepted_seq_lens
 
         import time as _time
         _t0 = _time.perf_counter()

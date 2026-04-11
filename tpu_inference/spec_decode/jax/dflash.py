@@ -187,9 +187,14 @@ class DFlashProposer:
         """Prepare DFlash inputs with on-device KV cache."""
         assert aux_hidden_states is not None and len(aux_hidden_states) > 0
 
-        # 1. Current sequence length
+        # 1. Current sequence length — read from CPU-side seq_lens to avoid
+        #    a device_get sync. The speculative_decoding_manager already has
+        #    the value on CPU (num_tokens_no_spec) before putting it on device.
         seq_len_jax = attn_metadata.seq_lens[0]
-        seq_len = int(jax.device_get(seq_len_jax))
+        if hasattr(attn_metadata, '_cpu_seq_lens'):
+            seq_len = int(attn_metadata._cpu_seq_lens[0])
+        else:
+            seq_len = int(jax.device_get(seq_len_jax))
 
         # 2. Crop cache to match GPU DynamicCache.crop(start) semantics.
         #
@@ -248,9 +253,11 @@ class DFlashProposer:
                 ctx = jnp.concatenate([ctx, pad], axis=0)
             new_ctx_jax = device_array(self.mesh, ctx)
 
-        # 6. Build noise block
-        seq_len_arr = device_array(self.mesh,
-                                   np.array([seq_len], dtype=np.int32))
+        # 6. Build noise block — reuse pre-allocated scalar buffer
+        if not hasattr(self, '_scalar_buf'):
+            self._scalar_buf = np.zeros(1, dtype=np.int32)
+        self._scalar_buf[0] = seq_len
+        seq_len_arr = device_array(self.mesh, self._scalar_buf)
         noise_input_ids, noise_positions = self._build_noise_block(
             seq_len_arr,
             next_token_ids,
@@ -259,13 +266,16 @@ class DFlashProposer:
         )
 
         # 7. Pack target_hidden_states as 3-tuple (always same pytree shape)
-        cache_len_arr = device_array(
-            self.mesh, np.array([self._cache_len], dtype=np.int32))
-        actual_ctx_count_arr = device_array(
-            self.mesh, np.array([actual_new_ctx_count], dtype=np.int32))
+        self._scalar_buf[0] = self._cache_len
+        cache_len_arr = device_array(self.mesh, self._scalar_buf)
+        self._scalar_buf[0] = actual_new_ctx_count
+        actual_ctx_count_arr = device_array(self.mesh, self._scalar_buf)
         target_hidden = (new_ctx_jax, cache_len_arr, actual_ctx_count_arr)
 
-        # 8. Build draft attention metadata
+        # 8. Build draft attention metadata — cache static arrays
+        if not hasattr(self, '_draft_query_start_loc'):
+            self._draft_query_start_loc = jnp.array(
+                [0, self.block_size], dtype=jnp.int32)
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
         block_tables = (
@@ -275,11 +285,14 @@ class DFlashProposer:
         draft_attn_metadata = replace(
             attn_metadata,
             input_positions=noise_positions,
-            query_start_loc=jnp.array([0, self.block_size], dtype=jnp.int32),
+            query_start_loc=self._draft_query_start_loc,
             block_tables=device_array(self.mesh, block_tables),
         )
 
-        dummy_last_indices = jnp.zeros(num_reqs, dtype=jnp.int32)
+        if not hasattr(self, '_dummy_last_indices'):
+            self._dummy_last_indices = jnp.zeros(
+                self.runner.max_num_reqs, dtype=jnp.int32)
+        dummy_last_indices = self._dummy_last_indices[:num_reqs]
         return (
             target_hidden,
             noise_input_ids,
