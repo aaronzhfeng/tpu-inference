@@ -167,6 +167,23 @@ class SpeculativeDecodingManager:
         # buffer and KV cache positions.
         accepted_seq_lens = self.runner.input_batch.num_tokens_no_spec[
             :attn_metadata.seq_lens.shape[0]].copy()
+
+        # DIAGNOSTIC: Compare seq_lens vs num_tokens_no_spec (same as Doc 21 debugging)
+        import sys
+        if not hasattr(self, '_diag_sdm_count'):
+            self._diag_sdm_count = 0
+        self._diag_sdm_count += 1
+        if self._diag_sdm_count <= 30:
+            _orig_sl = int(jax.device_get(attn_metadata.seq_lens[0]))
+            _accepted_sl = int(accepted_seq_lens[0])
+            _delta = _orig_sl - _accepted_sl
+            _n_accepted = len(sampled_token_ids[0]) if sampled_token_ids else 0
+            print(f"DIAG_SDM step={self._diag_sdm_count} "
+                  f"orig_seq_lens={_orig_sl} accepted_seq_lens={_accepted_sl} "
+                  f"delta={_delta} n_accepted={_n_accepted} "
+                  f"aux_shapes={[h.shape for h in aux_hidden_states[:1]] if aux_hidden_states else 'None'}",
+                  file=sys.stderr, flush=True)
+
         accepted_attn_metadata = replace(
             attn_metadata,
             seq_lens=device_array(
