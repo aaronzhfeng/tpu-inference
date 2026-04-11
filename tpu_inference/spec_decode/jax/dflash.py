@@ -209,14 +209,23 @@ class DFlashProposer:
         """Prepare DFlash inputs with on-device KV cache."""
         assert aux_hidden_states is not None and len(aux_hidden_states) > 0
 
-        # 1. Current sequence length — read from CPU-side seq_lens to avoid
-        #    a device_get sync. The speculative_decoding_manager already has
-        #    the value on CPU (num_tokens_no_spec) before putting it on device.
+        # 1. Current sequence length.
+        # num_tokens_no_spec (the accepted seq_len from the pipeline) includes
+        # the most recent sampled/bonus token. But aux_hidden_states from the
+        # target forward pass does NOT include a hidden state for that token —
+        # it was just sampled, not yet processed through the target backbone.
+        # Subtract 1 to get the position of the current noise block's first
+        # token, matching the standalone benchmark convention where seq_len is
+        # the count of tokens whose context features are available.
+        #
+        # Read from CPU-side seq_lens to avoid a device_get sync. The
+        # speculative_decoding_manager already has the value on CPU
+        # (num_tokens_no_spec) before putting it on device.
         seq_len_jax = attn_metadata.seq_lens[0]
         if hasattr(attn_metadata, '_cpu_seq_lens'):
-            seq_len = int(attn_metadata._cpu_seq_lens[0])
+            seq_len = int(attn_metadata._cpu_seq_lens[0]) - 1
         else:
-            seq_len = int(jax.device_get(seq_len_jax))
+            seq_len = int(jax.device_get(seq_len_jax)) - 1
 
         # 2. Crop cache to match GPU DynamicCache.crop(start) semantics.
         #
