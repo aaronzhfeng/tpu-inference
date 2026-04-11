@@ -973,10 +973,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 key=rejection_rng,
             )
             _rs_t2 = _time.perf_counter()
-            if not hasattr(self, '_rs_profile'):
-                self._rs_profile = {'select_logits': [], 'rejection': []}
-            self._rs_profile['select_logits'].append(_rs_t1 - _rs_t0)
-            self._rs_profile['rejection'].append(_rs_t2 - _rs_t1)
+            import logging
+            logging.getLogger('dflash.profile').info(
+                f"PROFILE rejection: select={(_rs_t1-_rs_t0)*1000:.2f}ms sampler={(_rs_t2-_rs_t1)*1000:.2f}ms")
 
         with self.maybe_forbid_compile:
             if tpu_sampling_metadata.logprobs:
