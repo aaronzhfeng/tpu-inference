@@ -218,15 +218,10 @@ class DFlashProposer:
             self._ctx_len = seq_len
         self._prev_seq_len = seq_len
 
-        # 3. Project new auxiliary hidden states (on-device, JIT'd)
-        projected = self._project_aux_hidden(self.state, aux_hidden_states)
-
-        # 4. Compute context update — slicing and padding stay on device
-        #    to avoid host<->TPU transfer overhead.
+        # 3. Compute context update range
         num_new = seq_len - self._ctx_len
         if num_new <= 0:
             # Full rejection — trim context tracking, use zero placeholder.
-            # Noise writes at cache_len + 0, completely overwriting padding.
             self._ctx_len = seq_len
             self._cache_len = min(self._cache_len, seq_len)
             actual_new_ctx_count = 0
@@ -240,14 +235,32 @@ class DFlashProposer:
             actual_new_ctx_count = n_copy
             self._ctx_len = end
 
-            # 5. Slice and pad on device — no host<->TPU transfer.
-            # Padding to power-of-2 sizes (16/32/64/128) means JIT only
-            # traces ~4 unique shapes, eliminating per-token retracing.
+            # 4. Trim aux_hidden_states to accepted tokens BEFORE projection.
+            # This matches standalone behavior: project only accepted tokens
+            # to prevent RMSNorm contamination from rejected tokens in the
+            # 16-token verification batch.
+            #
+            # Pad to power-of-2 to limit JIT shapes (~4 variants instead of
+            # 15+ unique sizes that cause compilation fragmentation).
+            padded_n = self._next_padded_size(n_copy)
+            trimmed_aux = tuple(
+                jnp.concatenate([
+                    h[:n_copy],
+                    jnp.zeros((padded_n - n_copy,) + h.shape[1:],
+                              dtype=h.dtype),
+                ], axis=0) if padded_n > n_copy else h[:padded_n]
+                for h in aux_hidden_states
+            )
+
+            # 5. Project trimmed+padded aux (fixed shapes for JIT stability)
+            projected = self._project_aux_hidden(self.state, trimmed_aux)
+
+            # 6. Slice to actual accepted count and pad context for KV write
             ctx = projected[:n_copy].astype(jnp.bfloat16)
-            padded_size = self._next_padded_size(n_copy)
-            if padded_size > n_copy:
+            ctx_padded_size = self._next_padded_size(n_copy)
+            if ctx_padded_size > n_copy:
                 pad = jnp.zeros(
-                    (padded_size - n_copy, self.hidden_size),
+                    (ctx_padded_size - n_copy, self.hidden_size),
                     dtype=jnp.bfloat16,
                 )
                 ctx = jnp.concatenate([ctx, pad], axis=0)
