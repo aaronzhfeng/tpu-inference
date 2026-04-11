@@ -108,15 +108,26 @@ class DFlashProposer:
         if target_embed is None:
             target_embed = getattr(target_model.model, "embed", None)
         if target_embed is not None and draft_embed is not None:
-            target_embed_value = target_embed.embedding.value
-            draft_embed_value = draft_embed.embedding.value
+            # Debug: log available attributes
+            logger.info(f"Draft embed type: {type(draft_embed)}, "
+                        f"attrs: {list(draft_embed.__dict__.keys()) if hasattr(draft_embed, '__dict__') else dir(draft_embed)[:10]}")
+            logger.info(f"Target embed type: {type(target_embed)}, "
+                        f"attrs: {list(target_embed.__dict__.keys()) if hasattr(target_embed, '__dict__') else dir(target_embed)[:10]}")
+            # Get embedding parameter - handle both nnx.Embed (.embedding) and JaxEmbed (.weight)
+            draft_embed_param = getattr(draft_embed, 'embedding', None) or getattr(draft_embed, 'weight', None)
+            target_embed_param = getattr(target_embed, 'embedding', None) or getattr(target_embed, 'weight', None)
+            if draft_embed_param is None or target_embed_param is None:
+                logger.warning(f"Cannot find embedding param: draft={draft_embed_param}, target={target_embed_param}")
+            else:
+                target_embed_value = target_embed_param.value
+                draft_embed_value = draft_embed_param.value
             if not jnp.any(draft_embed_value):
                 logger.info(
                     "Sharing target model embedding with DFlash draft model.")
-                draft_embed.embedding.value = target_embed_value
+                draft_embed_param.value = target_embed_value
             elif jnp.array_equal(draft_embed_value, target_embed_value):
                 logger.info("Draft embedding identical to target; sharing.")
-                draft_embed.embedding.value = target_embed_value
+                draft_embed_param.value = target_embed_value
 
         # Allocate on-device KV caches
         hf_config = self.draft_model_config.hf_config
