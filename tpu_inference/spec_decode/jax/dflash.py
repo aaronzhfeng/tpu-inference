@@ -85,7 +85,7 @@ class DFlashProposer:
         """Load the DFlash draft model and share embeddings from target."""
         (
             self.model_fn,
-            self.compute_logits_fn,
+            _,  # draft compute_logits — NOT used; DFlash uses target LM head
             _,
             self.combine_hidden_states_fn,
             _,
@@ -96,6 +96,11 @@ class DFlashProposer:
                       self.rng_key,
                       self.mesh,
                       is_draft_model=True)
+
+        # DFlash contract: draft hidden states are decoded with the TARGET
+        # model's LM head (shared embedding weights), not the draft's own.
+        self.target_compute_logits_fn = self.runner.compute_logits_fn
+        self.target_state = self.runner.state
 
         # Share the target model's embedding with the draft model.
         # IMPORTANT: Copy embedding VALUES only, not the entire module.
@@ -337,12 +342,12 @@ class DFlashProposer:
     @functools.partial(jax.jit, static_argnums=(0, ))
     def _sample_block_draft_tokens(
         self,
-        state: nnx.State,
+        target_state: nnx.State,
         hidden_states: jax.Array,
     ) -> jax.Array:
-        """Greedy-sample draft tokens from the block output."""
+        """Greedy-sample draft tokens using the TARGET model's LM head."""
         draft_hidden = hidden_states[1:1 + self.num_speculative_tokens]
-        logits = self.compute_logits_fn(state, draft_hidden, None)
+        logits = self.target_compute_logits_fn(target_state, draft_hidden, None)
         draft_ids = jnp.argmax(logits, axis=-1)
         return lax.with_sharding_constraint(
             draft_ids, NamedSharding(self.mesh, PartitionSpec()))
@@ -378,7 +383,7 @@ class DFlashProposer:
         self._cache_len = old_cache_len + actual_ctx_count + T_noise
 
         draft_token_ids = self._sample_block_draft_tokens(
-            self.state, hidden_states)
+            self.target_state, hidden_states)
 
         if draft_token_ids.ndim == 1:
             draft_token_ids = draft_token_ids[jnp.newaxis, :]
