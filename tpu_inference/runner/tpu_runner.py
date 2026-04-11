@@ -958,8 +958,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 bonus_logits,
                 tpu_sampling_metadata,
             )
+            import time as _time
+            _rs_t0 = _time.perf_counter()
             target_logits = self._select_from_array_fn(
                 logits, spec_decode_metadata.target_logits_indices)
+            _rs_t1 = _time.perf_counter()
             next_tokens = self.rejection_sampler(
                 draft_token_ids=spec_decode_metadata.draft_token_ids,
                 num_draft_tokens=spec_decode_metadata.draft_lengths,
@@ -969,6 +972,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 sampling_metadata=tpu_sampling_metadata,
                 key=rejection_rng,
             )
+            _rs_t2 = _time.perf_counter()
+            if not hasattr(self, '_rs_profile'):
+                self._rs_profile = {'select_logits': [], 'rejection': []}
+            self._rs_profile['select_logits'].append(_rs_t1 - _rs_t0)
+            self._rs_profile['rejection'].append(_rs_t2 - _rs_t1)
 
         with self.maybe_forbid_compile:
             if tpu_sampling_metadata.logprobs:

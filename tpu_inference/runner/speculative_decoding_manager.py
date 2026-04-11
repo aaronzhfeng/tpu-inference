@@ -174,6 +174,8 @@ class SpeculativeDecodingManager:
                 accepted_seq_lens.astype(np.int32)),
         )
 
+        import time as _time
+        _t0 = _time.perf_counter()
         target_hidden_states, input_ids, last_token_indices, attn_metadata = self.runner.drafter.prepare_inputs(
             accepted_attn_metadata,
             input_ids,
@@ -181,6 +183,7 @@ class SpeculativeDecodingManager:
             next_token_ids,
             num_rejected_tokens,
         )
+        _t1 = _time.perf_counter()
 
         propose_output = self.runner.drafter.propose(
             kv_caches=self.runner.kv_caches,
@@ -189,6 +192,11 @@ class SpeculativeDecodingManager:
             last_token_indices=last_token_indices,
             target_hidden_states=target_hidden_states,
         )
+        _t2 = _time.perf_counter()
+        if not hasattr(self, '_profile_data'):
+            self._profile_data = {'prepare': [], 'propose': [], 'total': []}
+        self._profile_data['prepare'].append(_t1 - _t0)
+        self._profile_data['propose'].append(_t2 - _t1)
         if len(propose_output) == 3:
             self.runner.kv_caches, draft_token_ids, draft_token_probs = (
                 propose_output)
