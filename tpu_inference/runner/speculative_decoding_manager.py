@@ -168,6 +168,21 @@ class SpeculativeDecodingManager:
         accepted_seq_lens = self.runner.input_batch.num_tokens_no_spec[
             :attn_metadata.seq_lens.shape[0]].copy()
 
+        # DFlash needs one further correction: num_tokens_no_spec counts the
+        # most recent sampled/bonus token, but that token has no hidden state
+        # in aux_hidden_states (the target backbone hasn't processed it yet —
+        # its context features are produced in the NEXT verification pass).
+        # Subtract 1 per request that actually sampled a token this step.
+        # Partial-prefill steps (empty sampled_token_ids[i]) don't increment
+        # num_tokens_no_spec with a sampled token, so no adjustment there.
+        if self.runner.speculative_config.method in ("dflash",
+                                                       "dflash_torchax"):
+            for i, token_ids in enumerate(sampled_token_ids):
+                if i >= len(accepted_seq_lens):
+                    break
+                if token_ids:
+                    accepted_seq_lens[i] -= 1
+
         # DIAGNOSTIC: Compare seq_lens vs num_tokens_no_spec (same as Doc 21 debugging)
         import sys
         if not hasattr(self, '_diag_sdm_count'):
