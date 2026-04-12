@@ -927,6 +927,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         logits_indices_selector: Optional[List[int]] = None,
         padded_num_reqs: Optional[int] = None,
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        # PHASE1_INSTR: wallclock breakdown of _sample_from_logits to find
+        # the 3-4 ms/token "dark matter" overhead gap vs standalone DFlash.
+        import time as _t
+        import sys as _sys
+        _p1_t0 = _t.perf_counter()
+        if not hasattr(self, '_p1_step_count'):
+            self._p1_step_count = 0
+            self._p1_last_entry = _p1_t0
+        self._p1_step_count += 1
+        _p1_gap = _p1_t0 - self._p1_last_entry
+        self._p1_last_entry = _p1_t0
+
         if padded_num_reqs is None:
             padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
                 self.input_batch.num_reqs, self.max_num_reqs)
@@ -936,6 +948,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.rng_params_for_sampling)
         else:
             step_rng = self.rng_params_for_sampling
+        _p1_t_setup = _t.perf_counter()
 
         if spec_decode_metadata is None:
             with self.maybe_forbid_compile:
@@ -1118,6 +1131,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             logprobs_lists = None
 
+        _p1_t_before_propose = _t.perf_counter()
         if self.speculative_config:
             with self.maybe_forbid_compile, jax.set_mesh(self.mesh):
                 self.speculative_decoding_manager.propose_draft_token_ids(
@@ -1128,6 +1142,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output,
                     input_ids,
                 )
+        _p1_t_after_propose = _t.perf_counter()
+
+        # PHASE1_INSTR: end-to-end per-step wallclock breakdown.
+        # Fires on every step after a short warmup.
+        if self._p1_step_count > 5 and self._p1_step_count <= 100:
+            _p1_total = _p1_t_after_propose - _p1_t0
+            _p1_setup = _p1_t_setup - _p1_t0
+            _p1_body = _p1_t_before_propose - _p1_t_setup
+            _p1_propose = _p1_t_after_propose - _p1_t_before_propose
+            print(
+                f"PHASE1 step={self._p1_step_count} "
+                f"gap_since_prev={_p1_gap*1000:.2f}ms "
+                f"total={_p1_total*1000:.2f}ms "
+                f"setup={_p1_setup*1000:.2f}ms "
+                f"body={_p1_body*1000:.2f}ms "
+                f"propose={_p1_propose*1000:.2f}ms",
+                file=_sys.stderr, flush=True)
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids,
