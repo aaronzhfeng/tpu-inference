@@ -115,6 +115,14 @@ class SpeculativeDecodingManager:
         scheduler_output: VllmSchedulerOutput,
         input_ids: jnp.ndarray,
     ) -> list[list[int]]:
+        # PHASE1C_INSTR: fine-grained timing inside propose_eagle3_draft_token_ids
+        # to locate the 9 ms Python wrap overhead.
+        import time as _tm
+        import sys as _sy
+        _pc_t0 = _tm.perf_counter()
+        if not hasattr(self, '_pc_count'):
+            self._pc_count = 0
+        self._pc_count += 1
         # Supports both Eagle3Proposer and DFlashProposer (same interface)
         assert hasattr(self.runner.drafter, 'prepare_inputs') and hasattr(
             self.runner.drafter, 'propose')
@@ -141,8 +149,10 @@ class SpeculativeDecodingManager:
         assert pad_len >= 0
         next_token_ids += [0] * pad_len
 
+        _pc_t_preprep = _tm.perf_counter()
         next_token_ids = device_array(
             self.runner.mesh, np.array(next_token_ids, dtype=jnp.int32))
+        _pc_t_nti = _tm.perf_counter()
 
         if spec_decode_metadata is None:
             num_rejected_tokens = None
@@ -158,6 +168,7 @@ class SpeculativeDecodingManager:
             num_rejected_tokens = device_array(
                 self.runner.mesh, np.array(num_rejected_tokens,
                                            dtype=jnp.int32))
+        _pc_t_nrt = _tm.perf_counter()
 
         # Use the actual accepted seq_len (num_tokens_no_spec) instead of
         # attn_metadata.seq_lens which includes unverified draft tokens.
@@ -200,6 +211,7 @@ class SpeculativeDecodingManager:
                   f"aux_shapes={[h.shape for h in aux_hidden_states[:1]] if aux_hidden_states else 'None'}",
                   file=sys.stderr, flush=True)
 
+        _pc_t_diag = _tm.perf_counter()
         accepted_attn_metadata = replace(
             attn_metadata,
             seq_lens=device_array(
@@ -215,6 +227,7 @@ class SpeculativeDecodingManager:
             self.runner.query_start_loc_cpu[:num_reqs_padded + 1].copy())
         accepted_attn_metadata.seq_lens_cpu = accepted_seq_lens.astype(
             np.int32)
+        _pc_t_amd = _tm.perf_counter()
 
         import time as _time
         _t0 = _time.perf_counter()
@@ -243,7 +256,9 @@ class SpeculativeDecodingManager:
         else:
             self.runner.kv_caches, draft_token_ids = propose_output
             draft_token_probs = None
+        _pc_t_unpack = _tm.perf_counter()
         draft_token_ids = np.array(draft_token_ids)
+        _pc_t_np = _tm.perf_counter()
         if draft_token_ids.ndim == 1:
             draft_token_ids = np.expand_dims(draft_token_ids, axis=-1)
         if draft_token_probs is None:
@@ -254,6 +269,21 @@ class SpeculativeDecodingManager:
             if draft_token_probs.ndim == 1:
                 draft_token_probs = np.expand_dims(draft_token_probs, axis=-1)
             self._draft_token_probs = draft_token_probs.tolist()
+        _pc_t_tolist = _tm.perf_counter()
+        # PHASE1C_INSTR: dump fine-grained breakdown
+        if 40 < self._pc_count <= 100:
+            print(
+                f"PHASE1C n={self._pc_count} "
+                f"preprep={(_pc_t_preprep-_pc_t0)*1000:.2f} "
+                f"nti={(_pc_t_nti-_pc_t_preprep)*1000:.2f} "
+                f"nrt={(_pc_t_nrt-_pc_t_nti)*1000:.2f} "
+                f"diag_block={(_pc_t_diag-_pc_t_nrt)*1000:.2f} "
+                f"amd={(_pc_t_amd-_pc_t_diag)*1000:.2f} "
+                f"profile={(_t2-_t0)*1000:.2f} "
+                f"unpack={(_pc_t_unpack-_t2)*1000:.2f} "
+                f"np_array={(_pc_t_np-_pc_t_unpack)*1000:.2f} "
+                f"tolist_total={(_pc_t_tolist-_pc_t_np)*1000:.2f}",
+                file=_sy.stderr, flush=True)
         return draft_token_ids.tolist()
 
     def get_spec_decode_metadata(
