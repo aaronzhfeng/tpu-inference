@@ -208,6 +208,13 @@ class SpeculativeDecodingManager:
         )
         # Attach CPU-side seq_lens so prepare_inputs can avoid device_get sync
         accepted_attn_metadata._cpu_seq_lens = accepted_seq_lens
+        # Eagle3's rejection-aware path reads these two CPU attrs directly.
+        # Provide them from the runner's shadow buffers.
+        num_reqs_padded = attn_metadata.seq_lens.shape[0]
+        accepted_attn_metadata.query_start_loc_cpu = (
+            self.runner.query_start_loc_cpu[:num_reqs_padded + 1].copy())
+        accepted_attn_metadata.seq_lens_cpu = accepted_seq_lens.astype(
+            np.int32)
 
         import time as _time
         _t0 = _time.perf_counter()
