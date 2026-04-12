@@ -648,6 +648,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         scheduler_output: "VllmSchedulerOutput",
         intermediate_tensors: Optional[JaxIntermediateTensors] = None,
     ) -> ModelRunnerOutput | JaxIntermediateTensors | None:
+        # PHASE1B_INSTR: time execute_model (target forward path).
+        import time as _t
+        import sys as _sys
+        _p1b_t0 = _t.perf_counter()
+        if not hasattr(self, '_p1b_exec_count'):
+            self._p1b_exec_count = 0
+            self._p1b_last_exit = _p1b_t0
+        self._p1b_exec_count += 1
+        _p1b_gap_since_last_exec = _p1b_t0 - self._p1b_last_exit
+
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
@@ -657,15 +667,42 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 f"execute_model: {reqs} reqs, {toks} toks"):
             output = self._execute_model(scheduler_output,
                                          intermediate_tensors)
+        _p1b_t1 = _t.perf_counter()
+        self._p1b_last_exit = _p1b_t1
+        if 5 < self._p1b_exec_count <= 100:
+            print(
+                f"PHASE1B_EXEC step={self._p1b_exec_count} "
+                f"gap={_p1b_gap_since_last_exec*1000:.2f}ms "
+                f"exec={(_p1b_t1-_p1b_t0)*1000:.2f}ms "
+                f"reqs={reqs} toks={toks}",
+                file=_sys.stderr, flush=True)
         return output
 
     def sample_tokens(
         self,
         grammar_output: "GrammarOutput | None",
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        # PHASE1B_INSTR: time sample_tokens entry + measure gap from
+        # execute_model exit.
+        import time as _t
+        import sys as _sys
+        _p1b_st_t0 = _t.perf_counter()
+        _p1b_exec_to_sample = (
+            _p1b_st_t0 - self._p1b_last_exit
+            if hasattr(self, '_p1b_last_exit') else 0.0)
+        if not hasattr(self, '_p1b_sample_count'):
+            self._p1b_sample_count = 0
+        self._p1b_sample_count += 1
+
         if self.execute_model_state is None:
             # This can happen in pipeline parallel case.
             return EMPTY_MODEL_RUNNER_OUTPUT
+
+        if 5 < self._p1b_sample_count <= 100:
+            print(
+                f"PHASE1B_SAMPLE n={self._p1b_sample_count} "
+                f"exec_to_sample={_p1b_exec_to_sample*1000:.2f}ms",
+                file=_sys.stderr, flush=True)
 
         (scheduler_output, attn_metadata, sampling_metadata, input_ids,
          hidden_states, logits, aux_hidden_states, spec_decode_metadata,
