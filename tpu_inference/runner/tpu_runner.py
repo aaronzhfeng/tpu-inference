@@ -1170,15 +1170,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         _p1_t_before_propose = _t.perf_counter()
         if self.speculative_config:
-            with self.maybe_forbid_compile, jax.set_mesh(self.mesh):
-                self.speculative_decoding_manager.propose_draft_token_ids(
-                    valid_sampled_token_ids,
-                    aux_hidden_states,
-                    attn_metadata,
-                    spec_decode_metadata,
-                    scheduler_output,
-                    input_ids,
-                )
+            # ABLATION: removed `with self.maybe_forbid_compile,
+            # jax.set_mesh(self.mesh):` wrap — Phase 1C showed this pair
+            # adds ~7.7 ms/step of hidden sync overhead. jax.set_mesh is
+            # already active from sample_tokens outer scope; maybe_forbid_compile
+            # is a debug guard. Both should be safe to drop in steady state.
+            _p1_t_ctx_entry = _t.perf_counter()
+            self.speculative_decoding_manager.propose_draft_token_ids(
+                valid_sampled_token_ids,
+                aux_hidden_states,
+                attn_metadata,
+                spec_decode_metadata,
+                scheduler_output,
+                input_ids,
+            )
+            _p1_t_ctx_exit = _t.perf_counter()
         _p1_t_after_propose = _t.perf_counter()
 
         # PHASE1_INSTR: end-to-end per-step wallclock breakdown.
