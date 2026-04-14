@@ -150,101 +150,111 @@ class DFlashAttention(nnx.Module):
           Phase B: write noise K/V at ``cache_len + actual_ctx_count``,
                    overwriting any padding zeros from Phase A.
 
-        Args:
-            x_noise: (T_noise, D) noise hidden states.
-            target_hidden: (T_padded, D) padded context features.
-            noise_positions: (T_noise,) position ids for noise tokens.
-            ctx_positions: (T_padded,) position ids for context tokens.
-            kv_cache_k: (B, N_heads, max_kv_len, H) pre-allocated K cache
-                where B = max_num_reqs. Writes/reads at ``slot_idx`` only.
+        Phase 4 batched args:
+            x_noise: (B, T_noise, D) noise hidden states.
+            target_hidden: (B, T_padded, D) padded context features.
+            noise_positions: (B, T_noise) position ids for noise tokens.
+            ctx_positions: (B, T_padded) position ids for context tokens.
+            kv_cache_k: (B, N_heads, max_kv_len, H) pre-allocated K cache.
             kv_cache_v: (B, N_heads, max_kv_len, H) pre-allocated V cache.
-            cache_len: scalar int, valid entries already in cache.
-            actual_ctx_count: scalar int, real (non-padding) context tokens.
-            slot_idx: scalar int, batch slot to write/read. At num_reqs=1
-                this is 0; Phase 4 will run attention batched over all slots.
+            cache_len: (B,) int, valid entries already in cache per slot.
+            actual_ctx_count: (B,) int, real context tokens per slot.
+            slot_idx: (B,) int, batch slot indices (identity in practice).
 
         Returns:
             (output, new_kv_cache_k, new_kv_cache_v)
         """
-        T_noise = x_noise.shape[0]
-        T_padded = target_hidden.shape[0]
+        B, T_noise, D = x_noise.shape
+        T_padded = target_hidden.shape[1]
 
-        q = self.q_proj(x_noise)
+        # Project Q/K/V by flattening the batch dim so existing Einsum
+        # patterns ("TD,DNH->TNH") still apply, then reshape back.
+        x_noise_flat = x_noise.reshape(B * T_noise, D)
+        q_flat = self.q_proj(x_noise_flat)  # (B*T_noise, N, H)
+        q = q_flat.reshape(B, T_noise, self.num_heads, self.head_dim)
         q = self.q_norm(q)
         q = apply_rope(
-            q,
-            noise_positions,
+            q.reshape(B * T_noise, self.num_heads, self.head_dim),
+            noise_positions.reshape(B * T_noise),
             self.head_dim_original,
             self.rope_theta,
             self.rope_scaling,
-        )
+        ).reshape(B, T_noise, self.num_heads, self.head_dim)
 
-        x_new = jnp.concatenate([target_hidden, x_noise], axis=0)
-        k_new = self.k_proj(x_new)
-        v_new = self.v_proj(x_new)
+        # Context + noise concatenated along the token axis per slot.
+        x_new = jnp.concatenate([target_hidden, x_noise], axis=1)  # (B, T_padded+T_noise, D)
+        T_all = T_padded + T_noise
+        x_new_flat = x_new.reshape(B * T_all, D)
+        k_new_flat = self.k_proj(x_new_flat)
+        v_new_flat = self.v_proj(x_new_flat)
+        k_new = k_new_flat.reshape(B, T_all, self.num_kv_heads,
+                                    self.head_dim)
+        v_new = v_new_flat.reshape(B, T_all, self.num_kv_heads,
+                                    self.head_dim)
         k_new = self.k_norm(k_new)
 
         new_positions = jnp.concatenate([ctx_positions, noise_positions],
-                                        axis=0)
+                                        axis=1)  # (B, T_all)
         k_new = apply_rope(
-            k_new,
-            new_positions,
+            k_new.reshape(B * T_all, self.num_kv_heads, self.head_dim),
+            new_positions.reshape(B * T_all),
             self.head_dim_original,
             self.rope_theta,
             self.rope_scaling,
-        )
+        ).reshape(B, T_all, self.num_kv_heads, self.head_dim)
 
         if self.num_kv_groups > 1:
-            k_new = jnp.repeat(k_new, self.num_kv_groups, axis=1)
-            v_new = jnp.repeat(v_new, self.num_kv_groups, axis=1)
+            k_new = jnp.repeat(k_new, self.num_kv_groups, axis=2)
+            v_new = jnp.repeat(v_new, self.num_kv_groups, axis=2)
 
-        k_ctx = k_new[:T_padded]
-        v_ctx = v_new[:T_padded]
-        k_noise = k_new[T_padded:]
-        v_noise = v_new[T_padded:]
+        # Split context / noise K/V per slot along token axis.
+        k_ctx = k_new[:, :T_padded]    # (B, T_padded, N, H)
+        v_ctx = v_new[:, :T_padded]
+        k_noise = k_new[:, T_padded:]  # (B, T_noise, N, H)
+        v_noise = v_new[:, T_padded:]
 
-        ctx_mask = (jnp.arange(T_padded) < actual_ctx_count)  # (T_padded,)
-        ctx_mask_kv = ctx_mask[:, jnp.newaxis, jnp.newaxis]  # (T_padded, 1, 1)
+        # Zero padded context entries per slot — each slot has its own
+        # actual_ctx_count.
+        ctx_mask = (jnp.arange(T_padded)[None, :]
+                    < actual_ctx_count[:, None])  # (B, T_padded)
+        ctx_mask_kv = ctx_mask[:, :, None, None]
         k_ctx = jnp.where(ctx_mask_kv, k_ctx, 0.0)
         v_ctx = jnp.where(ctx_mask_kv, v_ctx, 0.0)
 
-        k_ctx_4d = k_ctx.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
-        v_ctx_4d = v_ctx.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
-        kv_cache_k = lax.dynamic_update_slice(kv_cache_k, k_ctx_4d,
-                                              (slot_idx, 0, cache_len, 0))
-        kv_cache_v = lax.dynamic_update_slice(kv_cache_v, v_ctx_4d,
-                                              (slot_idx, 0, cache_len, 0))
+        # Write per-slot K/V into the batched cache with dynamic_update_slice
+        # at (slot_idx[b], 0, cache_len[b], 0). Python loop over B unrolls
+        # at JIT-trace time, since B = max_num_reqs is a static shape.
+        for b in range(B):
+            k_ctx_b = k_ctx[b].transpose(1, 0, 2)[jnp.newaxis]  # (1,N,Tp,H)
+            v_ctx_b = v_ctx[b].transpose(1, 0, 2)[jnp.newaxis]
+            kv_cache_k = lax.dynamic_update_slice(
+                kv_cache_k, k_ctx_b,
+                (slot_idx[b], 0, cache_len[b], 0))
+            kv_cache_v = lax.dynamic_update_slice(
+                kv_cache_v, v_ctx_b,
+                (slot_idx[b], 0, cache_len[b], 0))
 
-        noise_start = cache_len + actual_ctx_count
-        k_noise_4d = k_noise.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
-        v_noise_4d = v_noise.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
-        kv_cache_k = lax.dynamic_update_slice(kv_cache_k, k_noise_4d,
-                                              (slot_idx, 0, noise_start, 0))
-        kv_cache_v = lax.dynamic_update_slice(kv_cache_v, v_noise_4d,
-                                              (slot_idx, 0, noise_start, 0))
+        for b in range(B):
+            noise_start_b = cache_len[b] + actual_ctx_count[b]
+            k_noise_b = k_noise[b].transpose(1, 0, 2)[jnp.newaxis]
+            v_noise_b = v_noise[b].transpose(1, 0, 2)[jnp.newaxis]
+            kv_cache_k = lax.dynamic_update_slice(
+                kv_cache_k, k_noise_b,
+                (slot_idx[b], 0, noise_start_b, 0))
+            kv_cache_v = lax.dynamic_update_slice(
+                kv_cache_v, v_noise_b,
+                (slot_idx[b], 0, noise_start_b, 0))
 
-        new_cache_len = cache_len + actual_ctx_count + T_noise
+        new_cache_len = cache_len + actual_ctx_count + T_noise  # (B,)
         max_kv_len = kv_cache_k.shape[2]
 
-        q_4d = q.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
-        kv_ids = (jnp.arange(max_kv_len) < new_cache_len).astype(jnp.int32)
-        q_ids = jnp.ones(T_noise, dtype=jnp.int32)
-        seg_ids = SegmentIds(
-            q=q_ids[jnp.newaxis, :],
-            kv=kv_ids[jnp.newaxis, :],
-        )
-
-        # Phase 3: slice active slot from batched cache (B, N, L, H) →
-        # (1, N, L, H) to match the single-request Q batch dim. Uses
-        # dynamic_slice so slot_idx is runtime-variable, which Phase 4 will
-        # replace with a batched attention call over all active slots.
-        _, n_heads, max_kv_len, head_dim = kv_cache_k.shape
-        kv_k_active = lax.dynamic_slice(kv_cache_k,
-                                        (slot_idx, 0, 0, 0),
-                                        (1, n_heads, max_kv_len, head_dim))
-        kv_v_active = lax.dynamic_slice(kv_cache_v,
-                                        (slot_idx, 0, 0, 0),
-                                        (1, n_heads, max_kv_len, head_dim))
+        # Batched Q: (B, N, T_noise, H).
+        q_4d = q.transpose(0, 2, 1, 3)
+        # Batched SegmentIds. kv_ids[b,i] = 1 iff i < new_cache_len[b]; 0 else.
+        kv_ids = (jnp.arange(max_kv_len)[None, :]
+                  < new_cache_len[:, None]).astype(jnp.int32)  # (B, L)
+        q_ids = jnp.ones((B, T_noise), dtype=jnp.int32)
+        seg_ids = SegmentIds(q=q_ids, kv=kv_ids)
 
         sm_scale = self.head_dim_original**-0.5
         block_sizes = BlockSizes(
@@ -253,19 +263,22 @@ class DFlashAttention(nnx.Module):
             block_k=max_kv_len,
             block_b=1,
         )
+        # Batched flash_attention — leading dim matches B for Q and KV.
         attn_out = flash_attention(
             q_4d,
-            kv_k_active,
-            kv_v_active,
+            kv_cache_k,
+            kv_cache_v,
             segment_ids=seg_ids,
             causal=False,
             sm_scale=sm_scale,
             block_sizes=block_sizes,
             vmem_limit_bytes=_FA_VMEM_LIMIT,
-        )
+        )  # (B, N, T_noise, H)
 
-        attn_out = attn_out[0].transpose(1, 0, 2)
-        output = self.o_proj(attn_out)
+        attn_out = attn_out.transpose(0, 2, 1, 3)  # (B, T_noise, N, H)
+        attn_flat = attn_out.reshape(B * T_noise, self.num_heads,
+                                     self.head_dim)
+        output = self.o_proj(attn_flat).reshape(B, T_noise, D)
 
         return output, kv_cache_k, kv_cache_v
 
@@ -520,17 +533,17 @@ class DFlashForCausalLM(nnx.Module):
         target_hidden_states: jax.Array,
         attention_metadata,
     ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array]]:
-        """Forward pass for the DFlash draft model.
+        """Forward pass for the DFlash draft model (Phase 4 batched).
 
         ``target_hidden_states`` is a 4-tuple:
             (ctx_hidden, cache_len_arr, actual_ctx_count_arr, slot_idx_arr)
         where:
-            ctx_hidden: (T_padded, D) — padded context features.
-            cache_len_arr: (1,) int32 — valid entries already in KV cache.
-            actual_ctx_count_arr: (1,) int32 — real (non-padding) context count.
-            slot_idx_arr: (1,) int32 — which batch slot to write/read. Phase 3
-                routes the KV cache read/write at the active slot of the
-                batched cache (B, N, L, H) allocated in Phase 2.
+            ctx_hidden: (B, T_padded, D) — padded context features per slot.
+            cache_len_arr: (B,) int32 — valid entries in KV cache per slot.
+            actual_ctx_count_arr: (B,) int32 — real context count per slot.
+            slot_idx_arr: (B,) int32 — batch slot indices (identity in practice).
+
+        ``input_ids`` is (B, T_noise): batched noise tokens per slot.
 
         ``kv_caches`` is a flat list of length ``2 * num_layers``:
             [k_cache_0, v_cache_0, k_cache_1, v_cache_1, ...]
@@ -538,20 +551,27 @@ class DFlashForCausalLM(nnx.Module):
 
         Returns:
             (kv_caches, hidden_states, [target_hidden_states])
+            where hidden_states has shape (B, T_noise, D).
         """
         (ctx_hidden, cache_len_arr, actual_ctx_count_arr,
          slot_idx_arr) = target_hidden_states
-        cache_len = cache_len_arr[0]  # scalar
-        actual_ctx_count = actual_ctx_count_arr[0]  # scalar
-        slot_idx = slot_idx_arr[0]  # scalar
+        cache_len = cache_len_arr           # (B,)
+        actual_ctx_count = actual_ctx_count_arr  # (B,)
+        slot_idx = slot_idx_arr             # (B,)
 
-        noise_emb = self.model.embed_tokens(input_ids)
-        pos_offset = cache_len if self._position_scheme == "incremental" else 0
-        T_padded = ctx_hidden.shape[0]
-        T_noise = input_ids.shape[0]
-        ctx_positions = jnp.arange(T_padded, dtype=jnp.int32) + pos_offset
-        noise_positions = (jnp.arange(T_noise, dtype=jnp.int32) + pos_offset +
-                           actual_ctx_count)
+        noise_emb = self.model.embed_tokens(input_ids)  # (B, T_noise, D)
+        T_padded = ctx_hidden.shape[1]
+        T_noise = input_ids.shape[1]
+        # Position offsets per slot: (B,) broadcast against token axes.
+        if self._position_scheme == "incremental":
+            pos_offset = cache_len  # (B,)
+        else:
+            pos_offset = jnp.zeros_like(cache_len)
+        ctx_positions = (jnp.arange(T_padded, dtype=jnp.int32)[None, :]
+                         + pos_offset[:, None])  # (B, T_padded)
+        noise_positions = (jnp.arange(T_noise, dtype=jnp.int32)[None, :]
+                           + pos_offset[:, None]
+                           + actual_ctx_count[:, None])  # (B, T_noise)
 
         x = noise_emb
         for i, layer in enumerate(self.model.layers):
@@ -571,8 +591,7 @@ class DFlashForCausalLM(nnx.Module):
             kv_caches[2 * i] = kv_k
             kv_caches[2 * i + 1] = kv_v
 
-        x = self.model.norm(x)
-
+        x = self.model.norm(x)  # (B, T_noise, D)
         return kv_caches, x, []
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
