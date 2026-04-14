@@ -154,8 +154,9 @@ class DFlashAttention(nnx.Module):
             target_hidden: (T_padded, D) padded context features.
             noise_positions: (T_noise,) position ids for noise tokens.
             ctx_positions: (T_padded,) position ids for context tokens.
-            kv_cache_k: (1, N_heads, max_kv_len, H) pre-allocated K cache.
-            kv_cache_v: (1, N_heads, max_kv_len, H) pre-allocated V cache.
+            kv_cache_k: (B, N_heads, max_kv_len, H) pre-allocated K cache
+                where B = max_num_reqs. Phase 2 writes/reads slot 0 only.
+            kv_cache_v: (B, N_heads, max_kv_len, H) pre-allocated V cache.
             cache_len: scalar int, valid entries already in cache.
             actual_ctx_count: scalar int, real (non-padding) context tokens.
 
@@ -230,6 +231,12 @@ class DFlashAttention(nnx.Module):
             kv=kv_ids[jnp.newaxis, :],
         )
 
+        # Phase 2: slice active slot from batched cache (B, N, L, H) → (1, N, L, H)
+        # to match the single-request Q batch dim. Phase 4 will run attention
+        # batched across all active slots.
+        kv_k_active = kv_cache_k[0:1]
+        kv_v_active = kv_cache_v[0:1]
+
         sm_scale = self.head_dim_original**-0.5
         block_sizes = BlockSizes(
             block_q=T_noise,
@@ -239,8 +246,8 @@ class DFlashAttention(nnx.Module):
         )
         attn_out = flash_attention(
             q_4d,
-            kv_cache_k,
-            kv_cache_v,
+            kv_k_active,
+            kv_v_active,
             segment_ids=seg_ids,
             causal=False,
             sm_scale=sm_scale,

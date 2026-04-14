@@ -155,10 +155,12 @@ class DFlashProposer:
         head_dim = utils.get_padded_head_dim(head_dim_orig)
 
         self._max_kv_len = self._next_padded_size(self.max_model_len)
-        # Phase 1: keep batch dim 1 for KV cache to preserve existing c=1
-        # behavior. Phase 2 will change this to (max_num_reqs, ...) and wire
-        # per-slot KV cache writes in the model forward.
-        cache_shape = (1, num_heads, self._max_kv_len, head_dim)
+        # Phase 2: batch dim = max_num_reqs so each scheduler slot has its
+        # own KV cache row. Phase 2 only sizes the cache; writes/reads still
+        # target slot 0 until Phase 3 routes per-slot. At num_reqs=1 only
+        # slot 0 is touched, preserving existing behavior.
+        cache_shape = (self._max_num_reqs, num_heads, self._max_kv_len,
+                       head_dim)
         self._draft_kv_caches = []
         for _ in range(self.num_layers):
             k_cache = jnp.zeros(cache_shape, dtype=jnp.bfloat16)
