@@ -228,7 +228,10 @@ class DFlashProposer:
         """
         assert aux_hidden_states is not None and len(aux_hidden_states) > 0
 
-        num_reqs = attn_metadata.seq_lens.shape[0]
+        # `attn_metadata.seq_lens.shape[0]` is the padded batch size chosen
+        # by the runner's bucketing, not the true active request count —
+        # use `input_batch.num_reqs` for the slot loop upper bound.
+        num_reqs = self.runner.input_batch.num_reqs
         B = self._max_num_reqs
 
         # Read per-slot metadata from CPU-side attrs (avoid device_get sync).
