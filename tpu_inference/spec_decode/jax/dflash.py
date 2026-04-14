@@ -295,33 +295,24 @@ class DFlashProposer:
         # 3. Batched context tensor: (B, common_padded, D). Power-of-2 padded
         # to the max n_copy across active slots so JIT only traces a small
         # number of shapes (same set as the Phase 3 single-slot padding).
+        # Single zeros allocation + per-slot scatter avoids B intermediate
+        # concatenates that the prior ctx_parts build pattern produced.
         max_n_copy = int(per_slot_n_copy.max()) if num_reqs > 0 else 0
         common_padded = self._next_padded_size(max(max_n_copy, 1))
-        ctx_parts = []
-        for slot in range(B):
-            n_copy = int(per_slot_n_copy[slot]) if slot < num_reqs else 0
+        ctx_batched = jnp.zeros((B, common_padded, self.hidden_size),
+                                dtype=jnp.bfloat16)
+        for slot in range(num_reqs):
+            n_copy = int(per_slot_n_copy[slot])
             if n_copy > 0:
                 tok_start = int(per_slot_token_start[slot])
                 slot_ctx = projected[tok_start:tok_start + n_copy].astype(
                     jnp.bfloat16)
-                pad_size = common_padded - n_copy
-                if pad_size > 0:
-                    slot_ctx = jnp.concatenate([
-                        slot_ctx,
-                        jnp.zeros((pad_size, self.hidden_size),
-                                  dtype=jnp.bfloat16),
-                    ], axis=0)
-                ctx_parts.append(slot_ctx[jnp.newaxis, :, :])
-            else:
-                ctx_parts.append(
-                    jnp.zeros((1, common_padded, self.hidden_size),
-                              dtype=jnp.bfloat16))
-        ctx_batched = jnp.concatenate(ctx_parts, axis=0)
+                ctx_batched = ctx_batched.at[slot, :n_copy].set(slot_ctx)
         ctx_batched = device_array(self.mesh, ctx_batched)
 
         # 4. Batched noise block: (B, block_size) for input_ids + positions.
-        # Slot b's first noise token = next_token_ids[b]; rest are mask tokens.
-        # Positions = arange(block_size) + seq_len[b].
+        # Mask tokens everywhere on host; one batched scatter for the first
+        # tokens (next_token_ids lives on device, so this stays on device).
         noise_ids_np = np.full((B, self.block_size),
                                self.mask_token_id,
                                dtype=np.int32)
@@ -330,10 +321,11 @@ class DFlashProposer:
         for slot in range(num_reqs):
             noise_pos_np[slot] = pos_range + int(per_slot_seq_len[slot])
         noise_input_ids_batched = device_array(self.mesh, noise_ids_np)
-        # Overwrite position 0 of each active slot with its next_token_id.
-        for slot in range(num_reqs):
-            noise_input_ids_batched = noise_input_ids_batched.at[slot, 0].set(
-                next_token_ids[slot])
+        if num_reqs > 0:
+            # Single batched scatter replaces N chained per-slot .at[].set()
+            # calls — each chained call materialised a fresh jax array.
+            noise_input_ids_batched = noise_input_ids_batched.at[
+                :num_reqs, 0].set(next_token_ids[:num_reqs])
         noise_positions_batched = device_array(self.mesh, noise_pos_np)
 
         # 5. Pack (B,)-shaped scalars and slot_idx = identity.
