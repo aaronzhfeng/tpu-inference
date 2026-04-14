@@ -141,6 +141,7 @@ class DFlashAttention(nnx.Module):
         kv_cache_v: jax.Array,
         cache_len: jax.Array,
         actual_ctx_count: jax.Array,
+        slot_idx: jax.Array,
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """Non-causal attention with on-device KV cache.
 
@@ -155,10 +156,12 @@ class DFlashAttention(nnx.Module):
             noise_positions: (T_noise,) position ids for noise tokens.
             ctx_positions: (T_padded,) position ids for context tokens.
             kv_cache_k: (B, N_heads, max_kv_len, H) pre-allocated K cache
-                where B = max_num_reqs. Phase 2 writes/reads slot 0 only.
+                where B = max_num_reqs. Writes/reads at ``slot_idx`` only.
             kv_cache_v: (B, N_heads, max_kv_len, H) pre-allocated V cache.
             cache_len: scalar int, valid entries already in cache.
             actual_ctx_count: scalar int, real (non-padding) context tokens.
+            slot_idx: scalar int, batch slot to write/read. At num_reqs=1
+                this is 0; Phase 4 will run attention batched over all slots.
 
         Returns:
             (output, new_kv_cache_k, new_kv_cache_v)
@@ -208,17 +211,17 @@ class DFlashAttention(nnx.Module):
         k_ctx_4d = k_ctx.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
         v_ctx_4d = v_ctx.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
         kv_cache_k = lax.dynamic_update_slice(kv_cache_k, k_ctx_4d,
-                                              (0, 0, cache_len, 0))
+                                              (slot_idx, 0, cache_len, 0))
         kv_cache_v = lax.dynamic_update_slice(kv_cache_v, v_ctx_4d,
-                                              (0, 0, cache_len, 0))
+                                              (slot_idx, 0, cache_len, 0))
 
         noise_start = cache_len + actual_ctx_count
         k_noise_4d = k_noise.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
         v_noise_4d = v_noise.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
         kv_cache_k = lax.dynamic_update_slice(kv_cache_k, k_noise_4d,
-                                              (0, 0, noise_start, 0))
+                                              (slot_idx, 0, noise_start, 0))
         kv_cache_v = lax.dynamic_update_slice(kv_cache_v, v_noise_4d,
-                                              (0, 0, noise_start, 0))
+                                              (slot_idx, 0, noise_start, 0))
 
         new_cache_len = cache_len + actual_ctx_count + T_noise
         max_kv_len = kv_cache_k.shape[2]
@@ -231,11 +234,17 @@ class DFlashAttention(nnx.Module):
             kv=kv_ids[jnp.newaxis, :],
         )
 
-        # Phase 2: slice active slot from batched cache (B, N, L, H) → (1, N, L, H)
-        # to match the single-request Q batch dim. Phase 4 will run attention
-        # batched across all active slots.
-        kv_k_active = kv_cache_k[0:1]
-        kv_v_active = kv_cache_v[0:1]
+        # Phase 3: slice active slot from batched cache (B, N, L, H) →
+        # (1, N, L, H) to match the single-request Q batch dim. Uses
+        # dynamic_slice so slot_idx is runtime-variable, which Phase 4 will
+        # replace with a batched attention call over all active slots.
+        _, n_heads, max_kv_len, head_dim = kv_cache_k.shape
+        kv_k_active = lax.dynamic_slice(kv_cache_k,
+                                        (slot_idx, 0, 0, 0),
+                                        (1, n_heads, max_kv_len, head_dim))
+        kv_v_active = lax.dynamic_slice(kv_cache_v,
+                                        (slot_idx, 0, 0, 0),
+                                        (1, n_heads, max_kv_len, head_dim))
 
         sm_scale = self.head_dim_original**-0.5
         block_sizes = BlockSizes(
@@ -342,6 +351,7 @@ class DFlashDecoderLayer(nnx.Module):
         kv_cache_v: jax.Array,
         cache_len: jax.Array,
         actual_ctx_count: jax.Array,
+        slot_idx: jax.Array,
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """Returns (hidden_states, new_kv_cache_k, new_kv_cache_v)."""
         residual = x
@@ -355,6 +365,7 @@ class DFlashDecoderLayer(nnx.Module):
             kv_cache_v,
             cache_len,
             actual_ctx_count,
+            slot_idx,
         )
         x = residual + x
 
@@ -511,23 +522,28 @@ class DFlashForCausalLM(nnx.Module):
     ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array]]:
         """Forward pass for the DFlash draft model.
 
-        ``target_hidden_states`` is a 3-tuple:
-            (ctx_hidden, cache_len_arr, actual_ctx_count_arr)
+        ``target_hidden_states`` is a 4-tuple:
+            (ctx_hidden, cache_len_arr, actual_ctx_count_arr, slot_idx_arr)
         where:
             ctx_hidden: (T_padded, D) — padded context features.
             cache_len_arr: (1,) int32 — valid entries already in KV cache.
             actual_ctx_count_arr: (1,) int32 — real (non-padding) context count.
+            slot_idx_arr: (1,) int32 — which batch slot to write/read. Phase 3
+                routes the KV cache read/write at the active slot of the
+                batched cache (B, N, L, H) allocated in Phase 2.
 
         ``kv_caches`` is a flat list of length ``2 * num_layers``:
             [k_cache_0, v_cache_0, k_cache_1, v_cache_1, ...]
-        Each cache has shape ``(1, num_heads, max_kv_len, head_dim)``.
+        Each cache has shape ``(max_num_reqs, num_heads, max_kv_len, head_dim)``.
 
         Returns:
             (kv_caches, hidden_states, [target_hidden_states])
         """
-        ctx_hidden, cache_len_arr, actual_ctx_count_arr = target_hidden_states
+        (ctx_hidden, cache_len_arr, actual_ctx_count_arr,
+         slot_idx_arr) = target_hidden_states
         cache_len = cache_len_arr[0]  # scalar
         actual_ctx_count = actual_ctx_count_arr[0]  # scalar
+        slot_idx = slot_idx_arr[0]  # scalar
 
         noise_emb = self.model.embed_tokens(input_ids)
         pos_offset = cache_len if self._position_scheme == "incremental" else 0
@@ -550,6 +566,7 @@ class DFlashForCausalLM(nnx.Module):
                 kv_v,
                 cache_len,
                 actual_ctx_count,
+                slot_idx,
             )
             kv_caches[2 * i] = kv_k
             kv_caches[2 * i + 1] = kv_v

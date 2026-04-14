@@ -339,14 +339,19 @@ class DFlashProposer:
             self.block_size,
         )
 
-        # 7. Pack target_hidden_states as 3-tuple (always same pytree shape)
-        # Remember which slot propose() should update cache_len for.
+        # 7. Pack target_hidden_states as 4-tuple (always same pytree shape).
+        # Phase 3 adds slot_idx_arr so the model writes/reads the active slot
+        # of the batched KV cache. At num_reqs=1 slot_idx=0, identical behavior
+        # to Phase 2.
         self._active_slot = slot
         self._scalar_buf[0] = int(self._cache_len_slot[slot])
         cache_len_arr = device_array(self.mesh, self._scalar_buf)
         self._scalar_buf[0] = actual_new_ctx_count
         actual_ctx_count_arr = device_array(self.mesh, self._scalar_buf)
-        target_hidden = (new_ctx_jax, cache_len_arr, actual_ctx_count_arr)
+        self._scalar_buf[0] = slot
+        slot_idx_arr = device_array(self.mesh, self._scalar_buf)
+        target_hidden = (new_ctx_jax, cache_len_arr, actual_ctx_count_arr,
+                         slot_idx_arr)
 
         # 8. Build draft attention metadata — cache static arrays
         if not hasattr(self, '_draft_query_start_loc'):
@@ -428,7 +433,7 @@ class DFlashProposer:
         # Update cache_len: model wrote actual_ctx_count + T_noise entries.
         # This will be corrected at the start of the next prepare_inputs
         # to match the actual accepted seq_len.
-        _, cache_len_arr, actual_ctx_count_arr = target_hidden_states
+        _, cache_len_arr, actual_ctx_count_arr, _ = target_hidden_states
         old_cache_len = int(jax.device_get(cache_len_arr)[0])
         actual_ctx_count = int(jax.device_get(actual_ctx_count_arr)[0])
         T_noise = self.block_size
