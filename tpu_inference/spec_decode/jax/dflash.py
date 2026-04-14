@@ -394,9 +394,13 @@ class DFlashProposer:
     ) -> jax.Array:
         """Greedy-sample draft tokens using the TARGET model's LM head.
 
-        hidden_states: (B, T_noise, D). Returns (B, K) draft ids where
-        K = num_speculative_tokens.
+        Accepts either 2D ``(T_noise, D)`` (backward-compat precompile path)
+        or 3D ``(B, T_noise, D)`` (batched Phase 4 path). Returns ``(B, K)``
+        draft ids where ``K = num_speculative_tokens``. The 2D case is
+        treated as ``B=1``.
         """
+        if hidden_states.ndim == 2:
+            hidden_states = hidden_states[jnp.newaxis, :, :]
         draft_hidden = hidden_states[:, 1:1 + self.num_speculative_tokens, :]
         B, K, D = draft_hidden.shape
         draft_flat = draft_hidden.reshape(B * K, D)
