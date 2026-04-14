@@ -65,21 +65,29 @@ class DFlashProposer:
         self.rng_key = jax.random.key(self.vllm_config.model_config.seed)
         self.max_num_tokens = runner.max_num_tokens
         self.max_model_len = runner.max_model_len
+        self._max_num_reqs = runner.max_num_reqs
 
-        # Context length tracking (host-side counter)
-        self._ctx_len: int = 0
+        # Per-slot state (slot = batch position in vLLM's scheduler, 0..max_num_reqs-1)
+        # When a slot is reassigned to a new request_id, state for that slot
+        # is reset. This is Phase 1 batched-support groundwork: at num_reqs=1
+        # only slot 0 is ever used, preserving existing single-request behavior.
+        #
+        # - _ctx_len_slot: host-side counter of accepted context length.
+        # - _cache_len_slot: position in the draft KV cache where the next
+        #   noise block is written.
+        # - _prev_seq_len_slot: seq_len from the PREVIOUS prepare_inputs call.
+        #   GPU reference calls past_key_values_draft.crop(start) AFTER each
+        #   forward pass, where start = beginning of the CURRENT iteration's
+        #   block == seq_len from the PREVIOUS call. We match this by
+        #   restoring cache_len = prev_seq_len at the start of each step.
+        self._ctx_len_slot = np.zeros(self._max_num_reqs, dtype=np.int64)
+        self._cache_len_slot = np.zeros(self._max_num_reqs, dtype=np.int64)
+        self._prev_seq_len_slot = np.zeros(self._max_num_reqs, dtype=np.int64)
+        self._slot_req_id: list = [None] * self._max_num_reqs
 
         # On-device KV caches (allocated in load_model)
         self._draft_kv_caches: Optional[list[jax.Array]] = None
-        self._cache_len: int = 0
         self._max_kv_len: int = 0
-
-        # Track previous seq_len for GPU-compatible crop semantics.
-        # GPU calls past_key_values_draft.crop(start) AFTER each forward
-        # pass, where start = beginning of the CURRENT iteration's block.
-        # This equals the seq_len from the PREVIOUS call to prepare_inputs.
-        # We must match this: cache_len = prev_seq_len, not current seq_len.
-        self._prev_seq_len: int = 0
 
     def load_model(self, target_model: Any) -> None:
         """Load the DFlash draft model and share embeddings from target."""
@@ -147,6 +155,9 @@ class DFlashProposer:
         head_dim = utils.get_padded_head_dim(head_dim_orig)
 
         self._max_kv_len = self._next_padded_size(self.max_model_len)
+        # Phase 1: keep batch dim 1 for KV cache to preserve existing c=1
+        # behavior. Phase 2 will change this to (max_num_reqs, ...) and wire
+        # per-slot KV cache writes in the model forward.
         cache_shape = (1, num_heads, self._max_kv_len, head_dim)
         self._draft_kv_caches = []
         for _ in range(self.num_layers):
@@ -154,7 +165,6 @@ class DFlashProposer:
             v_cache = jnp.zeros(cache_shape, dtype=jnp.bfloat16)
             self._draft_kv_caches.append(k_cache)
             self._draft_kv_caches.append(v_cache)
-        self._cache_len = 0
 
         logger.info(
             "Allocated DFlash on-device KV caches: %d layers, shape %s",
@@ -219,9 +229,22 @@ class DFlashProposer:
         # in aux_hidden_states (its hidden state will be produced in the next
         # verification pass). On partial-prefill steps no sampling occurs and
         # no adjustment is applied. See propose_eagle3_draft_token_ids.
-        seq_len_jax = attn_metadata.seq_lens[0]
+        # Phase 1: Per-slot state. For now only slot 0 is wired because
+        # the model forward still assumes batch=1. Phase 3 will loop
+        # over all active slots. Detect slot reassignment (req_id change)
+        # and reset state when a new request takes a slot.
+        num_reqs = attn_metadata.seq_lens.shape[0]
+        slot = 0  # Phase 1: single-slot. Will become `for slot in range(num_reqs):` in Phase 3.
+        current_req_ids = self.runner.input_batch.req_ids[:num_reqs]
+        if self._slot_req_id[slot] != current_req_ids[slot]:
+            self._ctx_len_slot[slot] = 0
+            self._cache_len_slot[slot] = 0
+            self._prev_seq_len_slot[slot] = 0
+            self._slot_req_id[slot] = current_req_ids[slot]
+
+        seq_len_jax = attn_metadata.seq_lens[slot]
         if hasattr(attn_metadata, '_cpu_seq_lens'):
-            seq_len = int(attn_metadata._cpu_seq_lens[0])
+            seq_len = int(attn_metadata._cpu_seq_lens[slot])
         else:
             seq_len = int(jax.device_get(seq_len_jax))
 
@@ -240,34 +263,35 @@ class DFlashProposer:
         # which left stale noise K/V entries from the previous iteration
         # in positions [prev_seq_len, seq_len) and shifted all subsequent
         # RoPE positions, accumulating errors every iteration.
-        if self._prev_seq_len > 0:
-            self._cache_len = self._prev_seq_len
+        if self._prev_seq_len_slot[slot] > 0:
+            self._cache_len_slot[slot] = self._prev_seq_len_slot[slot]
 
-        if seq_len < self._ctx_len:
-            self._ctx_len = seq_len
-        self._prev_seq_len = seq_len
+        if seq_len < self._ctx_len_slot[slot]:
+            self._ctx_len_slot[slot] = seq_len
+        self._prev_seq_len_slot[slot] = seq_len
 
         # 3. Project new auxiliary hidden states (on-device, JIT'd)
         projected = self._project_aux_hidden(self.state, aux_hidden_states)
 
         # 4. Compute context update — slicing and padding stay on device
         #    to avoid host<->TPU transfer overhead.
-        num_new = seq_len - self._ctx_len
+        num_new = seq_len - int(self._ctx_len_slot[slot])
         if num_new <= 0:
             # Full rejection — trim context tracking, use zero placeholder.
             # Noise writes at cache_len + 0, completely overwriting padding.
-            self._ctx_len = seq_len
-            self._cache_len = min(self._cache_len, seq_len)
+            self._ctx_len_slot[slot] = seq_len
+            self._cache_len_slot[slot] = min(int(self._cache_len_slot[slot]), seq_len)
             actual_new_ctx_count = 0
             new_ctx_jax = device_array(
                 self.mesh,
                 jnp.zeros((16, self.hidden_size), dtype=jnp.bfloat16),
             )
         else:
-            end = min(self._ctx_len + num_new, self.max_model_len)
-            n_copy = end - self._ctx_len
+            end = min(int(self._ctx_len_slot[slot]) + num_new,
+                      self.max_model_len)
+            n_copy = end - int(self._ctx_len_slot[slot])
             actual_new_ctx_count = n_copy
-            self._ctx_len = end
+            self._ctx_len_slot[slot] = end
 
             # 5. Slice and pad on device — no host<->TPU transfer.
             # Padding to power-of-2 sizes (16/32/64/128) means JIT only
@@ -292,8 +316,10 @@ class DFlashProposer:
             # Fingerprint: aux hidden norm at position 0
             _aux_norm = float(jnp.linalg.norm(jax.device_get(aux_hidden_states[0][0]))) if aux_hidden_states else 0
             _proj_norm = float(jnp.linalg.norm(jax.device_get(projected[0]))) if num_new > 0 else 0
-            print(f"DIAG step={self._diag_count} seq_len={seq_len} prev_seq={self._prev_seq_len} "
-                  f"cache_len={self._cache_len} ctx_len={self._ctx_len} num_new={num_new} "
+            print(f"DIAG step={self._diag_count} slot={slot} seq_len={seq_len} "
+                  f"prev_seq={int(self._prev_seq_len_slot[slot])} "
+                  f"cache_len={int(self._cache_len_slot[slot])} "
+                  f"ctx_len={int(self._ctx_len_slot[slot])} num_new={num_new} "
                   f"n_copy={actual_new_ctx_count} "
                   f"next_tok={int(jax.device_get(next_token_ids[0]))} "
                   f"aux0_norm={_aux_norm:.2f} proj0_norm={_proj_norm:.2f}",
@@ -312,7 +338,9 @@ class DFlashProposer:
         )
 
         # 7. Pack target_hidden_states as 3-tuple (always same pytree shape)
-        self._scalar_buf[0] = self._cache_len
+        # Remember which slot propose() should update cache_len for.
+        self._active_slot = slot
+        self._scalar_buf[0] = int(self._cache_len_slot[slot])
         cache_len_arr = device_array(self.mesh, self._scalar_buf)
         self._scalar_buf[0] = actual_new_ctx_count
         actual_ctx_count_arr = device_array(self.mesh, self._scalar_buf)
@@ -402,7 +430,8 @@ class DFlashProposer:
         old_cache_len = int(jax.device_get(cache_len_arr)[0])
         actual_ctx_count = int(jax.device_get(actual_ctx_count_arr)[0])
         T_noise = self.block_size
-        self._cache_len = old_cache_len + actual_ctx_count + T_noise
+        self._cache_len_slot[self._active_slot] = (
+            old_cache_len + actual_ctx_count + T_noise)
 
         draft_token_ids = self._sample_block_draft_tokens(
             self.target_state, hidden_states)
@@ -417,7 +446,8 @@ class DFlashProposer:
             _hs = jax.device_get(hidden_states)
             # Log per-position hidden norm to see if attention is working
             _norms = [float(jnp.linalg.norm(_hs[i])) for i in range(min(4, _hs.shape[0]))]
-            print(f"DIAG propose: cache_len_after={self._cache_len} "
+            print(f"DIAG propose: slot={self._active_slot} "
+                  f"cache_len_after={int(self._cache_len_slot[self._active_slot])} "
                   f"draft_ids={list(_dt)} "
                   f"hidden_norms={[f'{n:.1f}' for n in _norms]}",
                   file=sys.stderr, flush=True)
