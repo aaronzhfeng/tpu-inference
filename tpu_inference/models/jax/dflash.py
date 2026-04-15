@@ -280,6 +280,19 @@ class DFlashAttention(nnx.Module):
                                      self.head_dim)
         output = self.o_proj(attn_flat).reshape(B, T_noise, D)
 
+        # DIAG: mirror of dev-rpa 0f6ff628 — print L2 norms so we can compare
+        # Phase 1 per-layer activation magnitudes against dev-rpa's 30-100x
+        # explosion. x=x_noise (the Q source input, matches dev-rpa semantics);
+        # k/v printed over the full (ctx+noise) new K/V tensor.
+        jax.debug.print(
+            "[DFlashAttn] x={a} q={b} k={c} v={d} attn={e} out={f}",
+            a=jnp.linalg.norm(x_noise),
+            b=jnp.linalg.norm(q),
+            c=jnp.linalg.norm(k_new),
+            d=jnp.linalg.norm(v_new),
+            e=jnp.linalg.norm(attn_out),
+            f=jnp.linalg.norm(output),
+        )
         return output, kv_cache_k, kv_cache_v
 
 
