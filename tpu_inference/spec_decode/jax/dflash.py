@@ -86,6 +86,7 @@ class DFlashProposer:
         (
             self.model_fn,
             self.compute_logits_fn,
+            _,
             self.combine_hidden_states_fn,
             _,
             self.state,
@@ -139,7 +140,7 @@ class DFlashProposer:
             cache_shape,
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
+    @functools.partial(jax.jit, static_argnums=(0, ))
     def _project_aux_hidden(
             self, state: nnx.State,
             aux_hidden_states: tuple[jax.Array, ...]) -> jax.Array:
