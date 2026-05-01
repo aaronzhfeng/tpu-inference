@@ -760,7 +760,7 @@ def jax_array_from_reshaped_torch(
         torch_weight = torch_weight.permute(*permute_dims)
 
     with cpu_mesh_context():
-        return t2j(torch_weight, use_dlpack=False)
+        return t2j(torch_weight, use_dlpack=True)
 
 
 def assign_and_shard_param(jax_param: nnx.Param,
@@ -817,6 +817,10 @@ def load_nnx_param_from_reshaped_torch(
                                                    reshape_dims=reshape_dims,
                                                    permute_dims=permute_dims)
     except Exception as e:
+        import traceback
+        print(f"[DIAG] Inner exception for '{param_name}': {type(e).__name__}: {e}",
+              flush=True)
+        traceback.print_exc()
         raise RuntimeError(
             f"Failed to convert torch weight for '{param_name}' ({torch_weight.shape}) to JAX array, with reshape_dims={reshape_dims} and permute_dims={permute_dims}"
         ) from e

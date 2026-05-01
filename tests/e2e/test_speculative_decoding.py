@@ -59,11 +59,24 @@ def get_eagle3_test_prompts():
     return prompts
 
 
+def get_dflash_test_prompts():
+    num_prompts = 100
+    prompts = []
+
+    for _ in range(num_prompts):
+        prompts.append(
+            "Predict the continuation of this sequence: 1 2 3 4 5 6 7 8")
+
+    return prompts
+
+
 def get_test_prompts(speculative_config: dict):
     if speculative_config['method'] == 'ngram':
         return get_ngram_test_prompts()
     elif speculative_config['method'] == 'eagle3':
         return get_eagle3_test_prompts()
+    elif speculative_config['method'] == 'dflash':
+        return get_dflash_test_prompts()
     else:
         raise NotImplementedError(
             f"{speculative_config['method']} is not supported yet.")
@@ -105,6 +118,7 @@ def _test_correctness_helper(
                       max_model_len=1024,
                       max_num_seqs=4,
                       tensor_parallel_size=_get_tensor_parallel_size(),
+                      kv_cache_memory_bytes=5_000_000_000,
                       async_scheduling=0)
         ref_outputs = ref_llm.generate(test_prompts, sampling_config)
 
@@ -118,6 +132,7 @@ def _test_correctness_helper(
                        max_model_len=1024,
                        max_num_seqs=4,
                        tensor_parallel_size=_get_tensor_parallel_size(),
+                       kv_cache_memory_bytes=5_000_000_000,
                        async_scheduling=0)
         spec_outputs = spec_llm.generate(test_prompts, sampling_config)
 
@@ -201,6 +216,7 @@ def _test_performance_helper(
                       max_num_seqs=1,
                       enable_prefix_caching=False,
                       tensor_parallel_size=_get_tensor_parallel_size(),
+                      kv_cache_memory_bytes=5_000_000_000,
                       async_scheduling=0)
 
         start_time = time.time()
@@ -218,6 +234,7 @@ def _test_performance_helper(
                        max_model_len=1024,
                        max_num_seqs=1,
                        tensor_parallel_size=_get_tensor_parallel_size(),
+                       kv_cache_memory_bytes=5_000_000_000,
                        enable_prefix_caching=False,
                        async_scheduling=0)
 
@@ -325,3 +342,38 @@ def test_eagle3_performance(
             "num_speculative_tokens": 2,
             "draft_tensor_parallel_size": 1
         }, 0.6 if _is_v7x() else 1.8)
+
+
+def test_dflash_correctness(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    '''
+    Compare the outputs of a original LLM and a speculative LLM
+    should be the same when using DFlash speculative decoding.
+    '''
+    model_name = 'Qwen/Qwen3-4B'
+
+    _test_correctness_helper(
+        monkeypatch, sampling_config, model_name, {
+            'model': "z-lab/Qwen3-4B-DFlash-b16",
+            "num_speculative_tokens": 15,
+            "method": "dflash",
+            "draft_tensor_parallel_size": 1
+        })
+
+
+def test_dflash_performance(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    '''
+    Test that DFlash speculative decoding provides performance improvement.
+    '''
+    _test_performance_helper(
+        monkeypatch, sampling_config, {
+            "method": "dflash",
+            "model": "z-lab/Qwen3-4B-DFlash-b16",
+            "num_speculative_tokens": 15,
+            "draft_tensor_parallel_size": 1
+        }, 0.6 if _is_v7x() else 1.5)
